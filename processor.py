@@ -1,31 +1,29 @@
 """
-processor.py — Contour-based Western Blot quantification pipeline.
+processor.py — Western Blot quantification pipeline.
 
-Detection core (replacing projection-based approach):
-  1. Auto-detect image type (light-bg dark bands / dark-bg bright bands)
-  2. Morphological background subtraction → bands = bright on black
-  3. Otsu threshold + sensitivity shift → binary band mask
-  4. findContours → bounding boxes
-  5. Group boxes by x-center → lanes  (equal-width, gapped boundaries)
-  6. Within each lane, merge overlapping y-intervals → bands
-  7. Measure Area / Mean / IntDen on the enhanced image
+Detection pipeline (operates entirely on the bright-band enhanced image):
+  1. detect_image_type  → 'light' or 'dark' background
+  2. preprocess         → bands = BRIGHT pixels on BLACK background
+  3. find_gel_bbox      → crop to membrane, discard black border
+  4. _col_projection    → sum columns of enhanced → lane x-peaks
+  5. _row_projection    → sum rows within each lane → band y-peaks
+  6. FWHM walk          → accurate band boundaries from signal drop-off
+  7. measure_roi        → Area / Mean / IntDen on enhanced image
 """
 
 import cv2
 import numpy as np
+from scipy.signal import find_peaks
 import pandas as pd
 
 
-# ════════════════════════ image-type detection ════════════════════════
+# ════════════════════════ image type ══════════════════════════════════
 
 def detect_image_type(gray: np.ndarray) -> str:
     """'light' = white/grey background with dark bands; 'dark' = black background.
 
-    Uses the 75th-percentile instead of the median so that ChemiDoc images
-    (grey membrane on a large black border) are still classified as 'light'
-    after the gel region has been cropped: p75 of a grey (~100) crop is
-    well above the 60-count cutoff, whereas pure-dark-bg fluorescence images
-    have p75 near zero.
+    Uses p75 so ChemiDoc images (grey gel crop, median ~100) are classified as
+    'light' even though their overall median is low due to the black border.
     """
     return "light" if float(np.percentile(gray, 75)) > 60 else "dark"
 
@@ -35,62 +33,56 @@ def detect_image_type(gray: np.ndarray) -> str:
 def preprocess(img_bgr: np.ndarray, radius: int = 50) -> np.ndarray:
     """Return enhanced image: bands = BRIGHT pixels on BLACK background.
 
-    Light-bg: dilation estimates the bright background; subtract gives dark→bright bands.
-    Dark-bg:  opening removes bright bands from the image; subtract gives bright bands.
+    Light-bg (white/grey bg, dark bands):
+        background = morphological dilation  →  bg − gray  (dark→bright)
+    Dark-bg (fluorescence, bright bands):
+        background = morphological opening   →  gray − bg  (bright stays)
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     img_type = detect_image_type(gray)
 
-    k = int(radius * 2 + 1)
+    k      = int(radius * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
     if img_type == "light":
         bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
-        return cv2.subtract(bg, gray)        # dark bands → bright
+        return cv2.subtract(bg, gray)
     else:
         bg = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
-        return cv2.subtract(gray, bg)        # bright bands − dark bg
+        return cv2.subtract(gray, bg)
 
 
 # ════════════════════════ gel bounding box ════════════════════════════
 
 def find_gel_bbox(gray: np.ndarray) -> tuple[int, int, int, int]:
-    """Auto-detect membrane region, removing border / calibration markers.
+    """Detect membrane region; discard black border and L-bracket markers.
 
-    Strategy:
-      1. Otsu threshold separates the bright membrane from the true black border.
-      2. Erode aggressively to destroy thin L-bracket calibration marks.
-      3. Take the LARGEST surviving connected component — that is the membrane.
-      4. Dilate back and return its bounding box.
+    Low threshold (5 % of max) keeps dark bands inside the membrane.
+    Erosion destroys thin L-brackets; largest connected component = membrane.
     """
     h, w = gray.shape
-    src = gray if detect_image_type(gray) == "dark" else cv2.bitwise_not(gray)
+    src  = gray if detect_image_type(gray) == "dark" else cv2.bitwise_not(gray)
 
-    # Low threshold: include the entire membrane region (grey bg + dark bands within).
-    # We intentionally include L-brackets too — they are removed later by erosion.
     thresh = max(8, int(src.max() * 0.05))
     _, mask = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY)
 
-    # Erode to kill thin L-brackets and corner artifacts
-    px = max(12, min(w, h) // 30)
+    px     = max(12, min(w, h) // 30)
     eroded = cv2.erode(mask,
                        cv2.getStructuringElement(cv2.MORPH_RECT, (px, px)),
                        iterations=3)
     if eroded.sum() == 0:
         return (0, 0, w, h)
 
-    # Keep only the LARGEST connected component (= the membrane)
     n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(eroded, connectivity=8)
     if n_lab <= 1:
         return (0, 0, w, h)
-    # stats row 0 = background; find largest foreground component
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    single = np.where(labels == largest, 255, 0).astype(np.uint8)
 
-    # Dilate back to restore membrane extents
+    largest  = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    single   = np.where(labels == largest, 255, 0).astype(np.uint8)
     restored = cv2.dilate(single,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (px * 2, px * 2)),
                           iterations=2)
+
     pts = cv2.findNonZero(restored)
     if pts is None:
         return (0, 0, w, h)
@@ -100,197 +92,155 @@ def find_gel_bbox(gray: np.ndarray) -> tuple[int, int, int, int]:
     return (max(0, x - p), max(0, y - p), min(w, x + bw + p), min(h, y + bh + p))
 
 
-# ════════════════════════ contour detection helpers ════════════════════
+# ════════════════════════ projection-based detection ══════════════════
 
-def _band_mask(enhanced: np.ndarray, sensitivity: float) -> np.ndarray:
-    """Binary mask of band pixels.
+def _smooth(arr: np.ndarray, k: int) -> np.ndarray:
+    k = max(1, k | 1)          # ensure odd
+    return np.convolve(arr, np.ones(k) / k, mode="same")
 
-    Finds the Otsu threshold on the enhanced image, then scales it by
-    sensitivity so that weaker bands are caught at lower values.
-    sensitivity 0.1 = very permissive, 0.9 = near-Otsu (strict).
+
+def _find_n_peaks(profile: np.ndarray, n: int, sensitivity: float) -> np.ndarray:
+    """Return exactly n peaks from profile, sorted by position.
+
+    Progressive search: relax distance + height thresholds until n peaks found,
+    then keep the n most prominent ones.
     """
-    if enhanced.max() == 0:
-        return np.zeros(enhanced.shape, dtype=np.uint8)
+    if profile.max() == 0 or n == 0:
+        return np.array([], dtype=int)
 
-    otsu_val, _ = cv2.threshold(
-        enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    # Higher sensitivity → lower threshold → more pixels flagged as bands
-    thresh = int(otsu_val * (0.15 + sensitivity * 0.85))
-    thresh = max(1, min(254, thresh))
+    norm = profile / profile.max()
+    size = len(norm)
 
-    _, binary = cv2.threshold(enhanced, thresh, 255, cv2.THRESH_BINARY)
+    for dist_f in [0.8, 0.6, 0.4, 0.25, 0.15, 0.08]:
+        dist = max(3, int(size * dist_f / n))
+        for s_f in [1.0, 0.7, 0.5, 0.35, 0.2, 0.1]:
+            h_thr = sensitivity * s_f
+            pks, props = find_peaks(norm, height=h_thr, distance=dist,
+                                    prominence=h_thr * 0.2)
+            if len(pks) >= n:
+                prom = props.get("prominences", norm[pks])
+                idx  = np.argsort(prom)[::-1][:n]
+                return np.sort(pks[idx])
 
-    h, w = enhanced.shape
-    md = min(h, w)
-    k_open  = max(2, md // 80)
-    k_close = max(3, md // 30)
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (k_open, k_open))
-    )
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
-    )
-    return binary
+    return np.array([], dtype=int)
 
 
-def _find_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """findContours → bounding boxes (x, y, w, h), noise filtered."""
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+def _find_auto_peaks(profile: np.ndarray, sensitivity: float) -> np.ndarray:
+    """Auto-detect peaks (no target count) with a single stable pass."""
+    if profile.max() == 0:
+        return np.array([], dtype=int)
+    norm  = profile / profile.max()
+    size  = len(norm)
+    dist  = max(5, size // 20)
+    h_thr = sensitivity
+    pks, _ = find_peaks(norm, height=h_thr, distance=dist, prominence=h_thr * 0.3)
+    return pks
+
+
+def _peaks_to_equal_boundaries(peaks: np.ndarray, size: int,
+                                gap_frac: float = 0.15) -> list[tuple[int, int]]:
+    """Convert peak x-positions → equal-width (left, right) with gap_frac gap."""
+    n = len(peaks)
+    if n == 0:
         return []
+    if n == 1:
+        hw = size // 4
+        return [(max(0, peaks[0] - hw), min(size, peaks[0] + hw))]
 
-    h, w = mask.shape
-    min_area = h * w * 0.0003        # must be ≥ 0.03 % of image area
-
-    boxes = []
-    for cnt in cnts:
-        if cv2.contourArea(cnt) < min_area:
-            continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        # Reject near-zero-height slivers and extreme vertical needles
-        if bh < 3 or bh / (bw + 1e-6) > 15:
-            continue
-        boxes.append((x, y, bw, bh))
-
-    return boxes
+    spacing = int(np.median(np.diff(peaks)))
+    half    = max(3, int(spacing * (1.0 - gap_frac) / 2))
+    return [(max(0, int(p) - half), min(size, int(p) + half)) for p in peaks]
 
 
-def _group_into_lanes(
-    boxes: list[tuple[int, int, int, int]],
-    n_lanes: int | None,
-    img_w: int,
-) -> list[list[tuple[int, int, int, int]]]:
-    """Group boxes into vertical lane columns by x-center clustering.
-
-    When n_lanes is given: force exactly n_lanes groups by taking the
-    (n_lanes-1) largest x-center gaps as split points.
-    When auto: split wherever the gap exceeds 1.5 × median gap.
-    """
-    if not boxes:
-        return []
-
-    boxes = sorted(boxes, key=lambda b: b[0] + b[2] // 2)
-    cxs   = [b[0] + b[2] // 2 for b in boxes]
-
-    if len(cxs) == 1:
-        return [boxes]
-
-    gaps = [cxs[i + 1] - cxs[i] for i in range(len(cxs) - 1)]
-
-    if n_lanes is not None:
-        n_splits = min(max(0, n_lanes - 1), len(gaps))
-        split_at = sorted(
-            sorted(range(len(gaps)), key=lambda i: gaps[i], reverse=True)[:n_splits]
-        )
-    else:
-        # If spacing between boxes is roughly uniform (CV < 0.4), each box is its
-        # own lane — this is the common case for well-separated single-band lanes.
-        # If spacing varies widely, large gaps mark the lane boundaries.
-        cv = float(np.std(gaps)) / (float(np.mean(gaps)) + 1e-6)
-        if cv < 0.4:
-            return [[b] for b in boxes]
-        med = float(np.median(gaps))
-        split_at = [i for i, g in enumerate(gaps) if g > med * 1.5]
-
-    groups, start = [], 0
-    for s in split_at:
-        groups.append(boxes[start : s + 1])
-        start = s + 1
-    groups.append(boxes[start:])
-
-    return [g for g in groups if g]
-
-
-def _lane_boundaries(
-    groups: list[list],
-    img_w: int,
-    gap_frac: float = 0.15,
-) -> list[tuple[int, int]]:
-    """Equal-width x-boundaries with gap_frac gap between adjacent lanes.
-
-    Using the median inter-center spacing ensures every lane box has
-    identical width → identical Area → fair IntDen comparison.
-    """
-    centers = sorted(
-        int(np.mean([b[0] + b[2] // 2 for b in g])) for g in groups
-    )
-    if len(centers) == 1:
-        hw = img_w // 4
-        return [(max(0, centers[0] - hw), min(img_w, centers[0] + hw))]
-
-    spacing = int(np.median(np.diff(centers)))
-    half = max(4, int(spacing * (1.0 - gap_frac) / 2))
-
-    return [(max(0, c - half), min(img_w, c + half)) for c in centers]
-
-
-def _uniform_lane_split(
-    boxes: list[tuple[int, int, int, int]],
-    n_lanes: int,
-    img_w: int,
-    gap_frac: float = 0.15,
-) -> list[tuple[int, int]]:
-    """Divide the detected signal x-region into n_lanes equal-width slots.
-
-    Used when detected groups < n_lanes (bands merge across lanes in the mask).
-    The x-extent comes from the union of all detected boxes.
-    """
-    if boxes:
-        x0 = min(b[0] for b in boxes)
-        x1 = max(b[0] + b[2] for b in boxes)
-    else:
-        x0, x1 = 0, img_w
-
-    sp   = (x1 - x0) / n_lanes
-    half = max(4, int(sp * (1.0 - gap_frac) / 2))
-
+def _uniform_split(x0: int, x1: int, n: int, gap_frac: float = 0.15,
+                   img_w: int = 9999) -> list[tuple[int, int]]:
+    """Divide [x0, x1] into n equal slots with gap_frac gap between each."""
+    sp   = (x1 - x0) / n
+    half = max(3, int(sp * (1.0 - gap_frac) / 2))
     return [
         (max(0, int(x0 + i * sp + sp / 2) - half),
          min(img_w, int(x0 + i * sp + sp / 2) + half))
-        for i in range(n_lanes)
+        for i in range(n)
     ]
 
 
-def _bands_from_boxes(
-    boxes: list[tuple[int, int, int, int]],
-) -> list[tuple[int, int]]:
-    """Convert per-lane box list → merged y-intervals (y0, y1).
+def _band_y_boundaries(lane_enhanced: np.ndarray,
+                       sensitivity: float,
+                       n_bands: int = 0) -> list[tuple[int, int]]:
+    """Detect band y-positions by row projection on the bright-band lane slice.
 
-    Sorts by y, merges boxes that are within 5 px of each other.
+    For each peak in the row profile:
+      • Walk outward from the peak until signal drops below 30 % of peak value
+        OR starts rising (entering the next band's territory).
+      • Add 1-pixel padding.
+
+    n_bands=0 means auto (keep all detected).
+    n_bands>0 keeps top-n by integrated row signal.
     """
-    if not boxes:
-        return []
+    h = lane_enhanced.shape[0]
+    if h == 0:
+        return [(0, 1)]
 
-    intervals = sorted((b[1], b[1] + b[3]) for b in boxes)
-    merged: list[list[int]] = []
-    for y0, y1 in intervals:
-        if merged and y0 <= merged[-1][1] + 5:
-            merged[-1][1] = max(merged[-1][1], y1)
-        else:
-            merged.append([y0, y1])
+    row_profile = lane_enhanced.sum(axis=1).astype(float)
+    k           = max(3, h // 25)
+    smooth_prof = _smooth(row_profile, k)
 
-    return [(y0, y1) for y0, y1 in merged]
+    if smooth_prof.max() == 0:
+        return [(0, h)]
+
+    norm = smooth_prof / smooth_prof.max()
+    dist = max(4, h // 12)
+
+    if n_bands > 0:
+        peaks = _find_n_peaks(norm, n_bands, sensitivity)
+    else:
+        peaks = _find_auto_peaks(norm, sensitivity)
+
+    if len(peaks) == 0:
+        # Fallback: use the single brightest row region
+        center = int(np.argmax(smooth_prof))
+        peaks  = np.array([center])
+
+    bands = []
+    for pk in peaks:
+        pk_val   = norm[pk]
+        edge_thr = max(sensitivity * 0.15, pk_val * 0.30)
+
+        y0 = int(pk)
+        while y0 > 0 and norm[y0 - 1] >= edge_thr and norm[y0 - 1] <= norm[y0]:
+            y0 -= 1
+
+        y1 = int(pk)
+        while y1 < h - 1 and norm[y1 + 1] >= edge_thr and norm[y1 + 1] <= norm[y1]:
+            y1 += 1
+
+        y0 = max(0,     y0 - 1)
+        y1 = min(h - 1, y1 + 1)
+        bands.append((y0, y1 + 1))
+
+    # Keep top-n by integrated signal (when forced)
+    if n_bands > 0 and len(bands) > n_bands:
+        scored = sorted(bands, key=lambda b: row_profile[b[0]:b[1]].sum(), reverse=True)
+        bands  = sorted(scored[:n_bands], key=lambda b: b[0])
+
+    return bands if bands else [(0, h)]
 
 
 # ════════════════════════ measurement ════════════════════════════════
 
-def measure_roi(
-    enhanced: np.ndarray, x0: int, x1: int, y0: int, y1: int
-) -> dict:
-    """Area / Mean / Min / Max / IntDen / RawIntDen for a rectangular ROI."""
-    roi = enhanced[y0:y1, x0:x1].astype(float)
-    area = roi.size
+def measure_roi(enhanced: np.ndarray, x0: int, x1: int,
+                y0: int, y1: int) -> dict:
+    """Area / Mean / Min / Max / IntDen / RawIntDen on the enhanced image."""
+    roi      = enhanced[y0:y1, x0:x1].astype(float)
+    area     = roi.size
     mean_val = float(roi.mean()) if area > 0 else 0.0
     return {
-        "Area":       int(area),
-        "Mean":       round(mean_val, 3),
-        "Min":        round(float(roi.min()) if area > 0 else 0.0, 1),
-        "Max":        round(float(roi.max()) if area > 0 else 0.0, 1),
-        "IntDen":     round(area * mean_val, 1),
-        "RawIntDen":  round(float(roi.sum()), 1),
+        "Area":      int(area),
+        "Mean":      round(mean_val, 3),
+        "Min":       round(float(roi.min()) if area > 0 else 0.0, 1),
+        "Max":       round(float(roi.max()) if area > 0 else 0.0, 1),
+        "IntDen":    round(area * mean_val, 1),
+        "RawIntDen": round(float(roi.sum()), 1),
     }
 
 
@@ -300,8 +250,8 @@ def analyze_rois(
     img_bgr: np.ndarray,
     rois: list[tuple[int, int, int, int]],
     radius: int = 50,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """Measure user-drawn rectangular ROIs directly (manual lane selection)."""
+) -> tuple[np.ndarray, pd.DataFrame, np.ndarray]:
+    """Measure user-defined rectangular ROIs directly (manual mode)."""
     enhanced  = preprocess(img_bgr, radius)
     annotated = img_bgr.copy()
     rows: list[dict] = []
@@ -331,14 +281,19 @@ def analyze(
     auto_crop: bool = True,
     skip_first_lane: bool = False,
     skip_last_lane: bool = False,
-) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int]]:
-    """Contour-based WB quantification pipeline.
+) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int], np.ndarray]:
+    """Projection-based WB quantification pipeline.
 
-    Returns (annotated_full_image, results_df, gel_bbox).
+    All detection runs on the bright-band enhanced image:
+      • Column projection  → lane x-positions
+      • Row projection     → band y-positions (FWHM boundaries)
+      • measure_roi        → IntDen on enhanced
+
+    Returns (annotated_img, df, gel_bbox, enhanced_crop).
     """
     gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # ── 1. Auto-crop to membrane region ──────────────────────────────
+    # ── 1. Crop to gel membrane ───────────────────────────────────────
     if auto_crop:
         gx0, gy0, gx1, gy1 = find_gel_bbox(gray_full)
         img_crop = img_bgr[gy0:gy1, gx0:gx1]
@@ -347,85 +302,55 @@ def analyze(
         gx1, gy1 = img_bgr.shape[1], img_bgr.shape[0]
         img_crop  = img_bgr
 
-    # ── 2. Preprocess: bands → bright on black ────────────────────────
+    # ── 2. Preprocess: dark bands → bright on black ───────────────────
     enhanced = preprocess(img_crop, radius)
     ch, cw   = enhanced.shape
 
-    # ── 3. Threshold → binary band mask ──────────────────────────────
-    mask  = _band_mask(enhanced, sensitivity)
+    # ── 3. Lane x-detection via column projection ─────────────────────
+    # Sum only rows with significant signal (top-50 %) to sharpen valleys
+    row_sums  = enhanced.sum(axis=1).astype(float)
+    band_rows = row_sums >= np.percentile(row_sums[row_sums > 0], 50) \
+                if (row_sums > 0).any() else np.ones(ch, dtype=bool)
+    col_profile = _smooth(enhanced[band_rows].sum(axis=0).astype(float),
+                          max(3, cw // 60))
 
-    # ── 4. Find contour boxes ─────────────────────────────────────────
-    boxes = _find_boxes(mask)
-
-    # ── 5. Determine lane x-boundaries ───────────────────────────────
     if n_lanes is not None:
-        # User specified lane count → divide the significant signal region
-        # evenly into n_lanes equal columns, ignoring artifact boxes.
-        # "Significant" = at least 15 % of the largest box's area.
-        if boxes:
-            max_area  = max(b[2] * b[3] for b in boxes)
-            sig_boxes = [b for b in boxes if b[2] * b[3] >= max_area * 0.15]
+        lane_peaks = _find_n_peaks(col_profile, n_lanes, sensitivity)
+        if len(lane_peaks) == n_lanes:
+            lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw)
         else:
-            sig_boxes = []
-        n_eff = n_lanes   # will be trimmed below for skip flags
-        boundaries = _uniform_lane_split(sig_boxes, n_eff, cw)
-        groups     = [[]] * n_eff
+            # Peaks not found → use extent of significant columns
+            sig_cols = np.where(col_profile > col_profile.max() * 0.1)[0]
+            x0_sig   = int(sig_cols[0])  if len(sig_cols) else 0
+            x1_sig   = int(sig_cols[-1]) if len(sig_cols) else cw
+            lane_bounds = _uniform_split(x0_sig, x1_sig, n_lanes, img_w=cw)
     else:
-        # Auto mode → cluster boxes into lanes by x-position
-        groups = _group_into_lanes(boxes, None, cw) if boxes else []
-        if groups:
-            boundaries = _lane_boundaries(groups, cw)
-        else:
-            boundaries = [(0, cw)]
-            groups     = [[]]
+        lane_peaks  = _find_auto_peaks(col_profile, sensitivity)
+        lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw) \
+                      if len(lane_peaks) else [(0, cw)]
 
-    # ── 6. Skip marker lanes ──────────────────────────────────────────
-    if skip_first_lane and len(boundaries) > 1:
-        boundaries = boundaries[1:]
-        groups     = groups[1:]
-    if skip_last_lane and len(boundaries) > 1:
-        boundaries = boundaries[:-1]
-        groups     = groups[:-1]
+    # ── 4. Skip marker lanes ──────────────────────────────────────────
+    if skip_first_lane and len(lane_bounds) > 1:
+        lane_bounds = lane_bounds[1:]
+    if skip_last_lane and len(lane_bounds) > 1:
+        lane_bounds = lane_bounds[:-1]
 
-    # ── 7. Per-lane: find bands, measure, annotate ────────────────────
+    # ── 5. Per-lane: row projection → band y-boundaries → measure ─────
     annotated = img_bgr.copy()
     rows: list[dict] = []
     color = (0, 200, 80) if n_bands_per_lane == 1 else (0, 220, 220)
 
-    for lane_idx, ((lx0, lx1), group) in enumerate(zip(boundaries, groups)):
+    for lane_idx, (lx0, lx1) in enumerate(lane_bounds):
+        lane_enh  = enhanced[:, lx0:lx1]
+        n_tgt     = n_bands_per_lane if n_bands_per_lane > 0 else 0
+        y_bands   = _band_y_boundaries(lane_enh, sensitivity, n_tgt)
 
-        # Re-run contours inside this lane's x-slice for accurate y-bounds
-        lane_mask = mask[:, lx0:lx1]
-        cnts, _ = cv2.findContours(
-            lane_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        h_img  = ch
-        w_lane = lx1 - lx0
-        min_a  = h_img * w_lane * 0.003   # ≥ 0.3 % of lane area
-
-        lane_boxes = []
-        for cnt in cnts:
-            if cv2.contourArea(cnt) < min_a:
-                continue
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw / (bh + 1e-6) > 20:
-                continue
-            lane_boxes.append((x, y, bw, bh))
-
-        # y-intervals from contour boxes
-        y_intervals = _bands_from_boxes(lane_boxes) if lane_boxes else [(0, ch)]
-
-        # Measure each band candidate
-        candidates: list[tuple[int, int, dict]] = []
-        for y0b, y1b in y_intervals:
+        # Keep top-N by IntDen and re-sort by position
+        candidates = []
+        for y0b, y1b in y_bands:
             m = measure_roi(enhanced, lx0, lx1, y0b, y1b)
             candidates.append((y0b, y1b, m))
 
-        if not candidates:
-            m = measure_roi(enhanced, lx0, lx1, 0, ch)
-            candidates = [(0, ch, m)]
-
-        # Keep top-N by IntDen, re-sort by y-position
         if n_bands_per_lane > 0 and len(candidates) > n_bands_per_lane:
             candidates = sorted(candidates,
                                 key=lambda c: c[2]["IntDen"], reverse=True
@@ -439,21 +364,16 @@ def analyze(
             abs_y1 = gy0 + y1b
 
             rows.append({
-                "Lane":    lane_idx + 1,
-                "Band":    band_idx + 1,
+                "Lane": lane_idx + 1, "Band": band_idx + 1,
                 "X_start": abs_x0, "X_end": abs_x1,
                 "Y_start": abs_y0, "Y_end": abs_y1,
                 **metrics,
             })
-
             cv2.rectangle(annotated, (abs_x0, abs_y0), (abs_x1, abs_y1), color, 2)
-            cv2.putText(
-                annotated, f"L{lane_idx + 1}",
-                (abs_x0 + 4, abs_y0 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
-            )
+            cv2.putText(annotated, f"L{lane_idx + 1}",
+                        (abs_x0 + 4, abs_y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-    # Draw gel bbox in blue
     if auto_crop:
         cv2.rectangle(annotated, (gx0, gy0), (gx1, gy1), (255, 120, 0), 2)
 
