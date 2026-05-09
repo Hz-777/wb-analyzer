@@ -320,6 +320,43 @@ def _band_y_boundaries(lane_enhanced: np.ndarray,
     return bands if bands else [(0, h)]
 
 
+def _y_roi_from_hint(
+    lane_enhanced: np.ndarray,
+    target_y: int,
+    sensitivity: float,
+) -> tuple[int, int]:
+    """Return (y0, y1) anchored at a user-specified y-coordinate.
+
+    Walks outward from target_y using the same FWHM logic as
+    _band_y_boundaries, so the box tightly wraps the band at that position
+    without needing peak detection at all.
+    """
+    h           = lane_enhanced.shape[0]
+    row_profile = lane_enhanced.sum(axis=1).astype(float)
+    k           = max(3, h // 25)
+    smooth      = _smooth(row_profile, k)
+
+    if smooth.max() == 0 or h == 0:
+        pad = max(5, h // 10)
+        return (max(0, target_y - pad), min(h, target_y + pad + 1))
+
+    norm     = smooth / smooth.max()
+    pk       = int(np.clip(target_y, 0, h - 1))
+    pk_val   = norm[pk]
+    edge_thr = max(sensitivity * 0.10, pk_val * 0.20)
+
+    y0 = pk
+    while y0 > 0 and norm[y0 - 1] >= edge_thr and norm[y0 - 1] <= norm[y0]:
+        y0 -= 1
+
+    y1 = pk
+    while y1 < h - 1 and norm[y1 + 1] >= edge_thr and norm[y1 + 1] <= norm[y1]:
+        y1 += 1
+
+    pad = max(3, (y1 - y0) // 4)
+    return (max(0, y0 - pad), min(h, y1 + pad + 1))
+
+
 # ════════════════════════ measurement ════════════════════════════════
 
 def _gaussian_col_weights(width: int) -> np.ndarray:
@@ -517,6 +554,7 @@ def analyze(
     skip_first_lane: bool = False,
     skip_last_lane: bool = False,
     lane_bounds_override: list[tuple[int, int]] | None = None,
+    target_band_y: int | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int], np.ndarray]:
     """Projection-based WB quantification pipeline.
 
@@ -596,7 +634,13 @@ def analyze(
     for lane_idx, (lx0, lx1) in enumerate(lane_bounds):
         lane_enh  = enhanced[:, lx0:lx1]
         n_tgt     = n_bands_per_lane if n_bands_per_lane > 0 else 0
-        y_bands   = _band_y_boundaries(lane_enh, sensitivity, n_tgt)
+
+        if target_band_y is not None:
+            # User clicked on the band: use FWHM anchored at that y (crop coords)
+            crop_y  = int(target_band_y) - gy0
+            y_bands = [_y_roi_from_hint(lane_enh, crop_y, sensitivity)]
+        else:
+            y_bands = _band_y_boundaries(lane_enh, sensitivity, n_tgt)
 
         # Keep top-N by IntDen and re-sort by position
         candidates = []

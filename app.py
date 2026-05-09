@@ -69,8 +69,8 @@ def load_image(uploaded) -> np.ndarray | None:
     data = np.frombuffer(uploaded.read(), dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
-def run_auto(img_bgr, n_bands=1, force_n_lanes=None):
-    """force_n_lanes overrides auto/manual setting (used to sync reference to target)."""
+def run_auto(img_bgr, n_bands=1, force_n_lanes=None, target_band_y=None):
+    """force_n_lanes overrides auto/manual setting; target_band_y pins the band."""
     if force_n_lanes is not None:
         n = force_n_lanes
     elif not auto_lanes:
@@ -85,8 +85,53 @@ def run_auto(img_bgr, n_bands=1, force_n_lanes=None):
         auto_crop=auto_crop,
         skip_first_lane=skip_first,
         skip_last_lane=skip_last,
+        target_band_y=target_band_y,
     )
     return annotated, df, bbox, enhanced
+
+
+def band_y_selector(img_bgr: np.ndarray, key: str, label: str = "") -> int | None:
+    """Click-to-select target band y-coordinate.
+
+    Shows the image; user clicks the band of interest.  A cyan guide line
+    is drawn at the selected y-position.  Returns pixel y in original image
+    space, or None if nothing selected (falls back to auto-detection).
+    """
+    ck   = f"{key}_by"
+    prev = f"{key}_by_prev"
+    if ck not in st.session_state:
+        st.session_state[ck] = None
+
+    if label:
+        st.markdown(f"**{label}**")
+
+    col_info, col_btn = st.columns([4, 1])
+    with col_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 清除", key=f"{key}_by_reset"):
+            st.session_state[ck] = None
+            st.rerun()
+    with col_info:
+        y_val = st.session_state[ck]
+        if y_val is not None:
+            st.success(f"✅ 已锁定条带 y = {y_val}（青色线）")
+        else:
+            st.info("👆 点击图片中要检测的蛋白条带")
+
+    overlay = img_bgr.copy()
+    if st.session_state[ck] is not None:
+        cv2.line(overlay, (0, st.session_state[ck]),
+                 (img_bgr.shape[1], st.session_state[ck]), (0, 255, 255), 2)
+
+    img_pil = PILImage.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    clicked = streamlit_image_coordinates(img_pil, key=f"{key}_by_canvas",
+                                          use_column_width=True)
+    if clicked is not None and clicked != st.session_state.get(prev):
+        st.session_state[ck]   = int(clicked["y"])
+        st.session_state[prev] = clicked
+        st.rerun()
+
+    return st.session_state[ck]
 
 def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
     """Click-based manual lane selection.
@@ -267,8 +312,10 @@ if mode == "单膜分析":
             annotated, df, enh = analyze_rois(img, rois, radius=radius)
         bbox = (0, 0, img.shape[1], img.shape[0])
     else:
+        target_y = band_y_selector(img, key="s1_band",
+                                    label="📍 点击图片指定要检测的条带（不点则自动检测最强条带）")
         with st.spinner("分析中…"):
-            annotated, df, bbox, enh = run_auto(img, n_bands=1)
+            annotated, df, bbox, enh = run_auto(img, n_bands=1, target_band_y=target_y)
 
     st.divider()
     show_result_images(img, annotated, enh, bbox)
@@ -305,6 +352,14 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         bbox_t = (0, 0, img_t.shape[1], img_t.shape[0])
         bbox_r = (0, 0, img_r.shape[1], img_r.shape[0])
     else:
+        # ── 点击指定目标条带 ──────────────────────────────────────────
+        st.markdown("#### 📍 指定要检测的条带位置（点击图片，不点则自动选最强条带）")
+        cy1, cy2 = st.columns(2)
+        with cy1:
+            target_y_t = band_y_selector(img_t, key="t2_band", label="目的蛋白条带")
+        with cy2:
+            target_y_r = band_y_selector(img_r, key="r2_band", label="内参条带")
+
         n_forced = None if auto_lanes else int(n_lanes)
         with st.spinner("融合两图列轮廓，检测泳道…"):
             bounds_t, bounds_r, bbox_t, bbox_r = dual_lane_bounds(
@@ -320,12 +375,14 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
                 auto_crop=auto_crop,
                 skip_first_lane=skip_first, skip_last_lane=skip_last,
                 lane_bounds_override=bounds_t,
+                target_band_y=target_y_t,
             )
             ann_r, df_r, bbox_r, enh_r = analyze(
                 img_r, radius=radius, n_bands_per_lane=1,
                 auto_crop=auto_crop,
                 skip_first_lane=skip_first, skip_last_lane=skip_last,
                 lane_bounds_override=bounds_r,
+                target_band_y=target_y_r,
             )
 
     st.divider()
@@ -379,11 +436,33 @@ else:
             cv2.putText(annotated,f"R{i+1}",(x0+4,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2)
         bbox = (0, 0, img.shape[1], img.shape[0])
     else:
-        with st.spinner("分析中（检测每泳道前两强条带）…"):
-            annotated, df_all, bbox, enh = run_auto(img, n_bands=2)
-        target_band_no = 1 if "上方" in target_pos else 2
-        df_t = df_all[df_all["Band"] == target_band_no].copy()
-        df_r = df_all[df_all["Band"] == (3 - target_band_no)].copy()
+        st.markdown("#### 📍 指定两条条带位置（点击图片，不点则自动检测前两强条带）")
+        cy1, cy2 = st.columns(2)
+        with cy1:
+            target_y_t3 = band_y_selector(img, key="s3t_band", label="目的蛋白条带")
+        with cy2:
+            target_y_r3 = band_y_selector(img, key="s3r_band", label="内参条带")
+
+        if target_y_t3 is not None and target_y_r3 is not None:
+            # Both clicked: run two separate analyses with pinned y-positions
+            with st.spinner("分析中…"):
+                annotated_t, df_t, bbox, enh = run_auto(img, n_bands=1,
+                                                         target_band_y=target_y_t3)
+                annotated_r, df_r, _,    _   = run_auto(img, n_bands=1,
+                                                         target_band_y=target_y_r3)
+            # Merge annotations
+            annotated = annotated_t.copy()
+            for _, row in df_r.iterrows():
+                cv2.rectangle(annotated,
+                              (int(row["X_start"]), int(row["Y_start"])),
+                              (int(row["X_end"]),   int(row["Y_end"])),
+                              (0, 180, 255), 2)
+        else:
+            with st.spinner("分析中（检测每泳道前两强条带）…"):
+                annotated, df_all, bbox, enh = run_auto(img, n_bands=2)
+            target_band_no = 1 if "上方" in target_pos else 2
+            df_t = df_all[df_all["Band"] == target_band_no].copy()
+            df_r = df_all[df_all["Band"] == (3 - target_band_no)].copy()
 
     st.divider()
     show_result_images(img, annotated, enh, bbox)
