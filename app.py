@@ -4,14 +4,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image as PILImage
-from streamlit_drawable_canvas import st_canvas
 
 from processor import analyze, analyze_rois, preprocess
 
 st.set_page_config(page_title="WB 条带自动定量", page_icon="🧬", layout="wide")
 st.title("🧬 Western Blot 条带灰度值自动定量")
 
-# ── 分析模式 & 泳道选择方式 ────────────────────────────────────────────────
+# ── 模式选择 ──────────────────────────────────────────────────────────────────
 col_m1, col_m2 = st.columns(2)
 with col_m1:
     mode = st.radio(
@@ -21,17 +20,17 @@ with col_m1:
 with col_m2:
     lane_mode = st.radio(
         "泳道选择方式",
-        ["🤖 自动检测", "✏️ 手动框选（在图片上拖框）"],
-        help="手动框选：用鼠标在图片上拖动画出矩形，每个矩形 = 一条泳道，支持撤销（Delete 键）。",
+        ["🤖 自动检测", "✏️ 手动框选（滑块定位）"],
+        help="手动模式：拖动滑块框住泳道区域，指定数量后自动等分。适用于自动检测不准的情况。",
     )
 manual = lane_mode.startswith("✏️")
 st.divider()
 
-# ── 侧边栏参数 ─────────────────────────────────────────────────────────────
+# ── 侧边栏 ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("参数设置")
     auto_crop = st.checkbox("自动裁剪到胶体区域", value=True,
-        help="适用于 ChemiDoc 等暗背景图片，排除黑色边框干扰。手动框选时仍用于预处理。")
+        help="适用于 ChemiDoc 等暗背景图片，排除黑色边框干扰。")
     radius = st.slider("背景去除半径（rolling ball）", 10, 150, 50, 5)
 
     if not manual:
@@ -40,31 +39,29 @@ with st.sidebar:
         if not auto_lanes:
             n_lanes = st.number_input("指定泳道数量", 1, 30, 6, 1)
         sensitivity = st.slider("检测灵敏度", 0.05, 0.80, 0.25, 0.05)
-
         st.markdown("**排除 Marker 泳道**")
         skip_first = st.checkbox("跳过最左侧泳道（左侧 marker）", value=False)
         skip_last  = st.checkbox("跳过最右侧泳道（右侧 marker）", value=False)
     else:
-        skip_first = False
-        skip_last  = False
+        skip_first = skip_last = False
 
     if mode == "单膜对比（目的蛋白+内参 同一张膜）" and not manual:
         st.divider()
         target_pos = st.radio("目的蛋白条带位置",
             ["上方条带（分子量较大）", "下方条带（分子量较小）"])
+    else:
+        target_pos = "上方条带（分子量较大）"
 
     st.divider()
     st.markdown(
         "**使用说明**\n\n"
-        "- 手动框选：在图片上拖框标记每条泳道\n"
+        "- 手动框选：滑块圈定泳道区域，自动等分\n"
         "- 自动检测：调整灵敏度参数\n"
         "- 暗背景图片请勾选『自动裁剪』"
     )
 
 
-# ── 工具函数 ───────────────────────────────────────────────────────────────
-CANVAS_MAX_W = 900
-
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
 def load_image(uploaded) -> np.ndarray | None:
     if uploaded is None:
         return None
@@ -82,49 +79,41 @@ def run_auto(img_bgr, n_bands=1):
         skip_last_lane=skip_last,
     )
 
-def canvas_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
-    """Show a drawable canvas over the image; return list of (x0,y0,x1,y1) ROIs."""
+def slider_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
+    """Slider-based manual lane selection. Returns list of (x0,y0,x1,y1) ROIs."""
     h, w = img_bgr.shape[:2]
-    scale = min(1.0, CANVAS_MAX_W / w)
-    cw, ch = int(w * scale), int(h * scale)
-    img_pil = PILImage.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-
     if label:
-        st.markdown(f"**{label}** — 在图片上拖动鼠标画矩形框选每条泳道，Delete 键删除最后一个框")
+        st.markdown(f"**{label}**")
 
-    result = st_canvas(
-        fill_color="rgba(0, 200, 80, 0.15)",
-        stroke_width=2,
-        stroke_color="#00C850",
-        background_image=img_pil,
-        drawing_mode="rect",
-        width=cw,
-        height=ch,
-        key=key,
-        update_streamlit=True,
-    )
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        n = st.number_input("泳道数量", 1, 30, 6, 1, key=f"{key}_n")
+        x_range = st.slider("水平范围（覆盖所有泳道）", 0, w, (max(0, w//10), min(w, w*9//10)),
+                            key=f"{key}_x")
+        y_range = st.slider("垂直范围（框住条带行）", 0, h, (max(0, h//5), min(h, h*4//5)),
+                            key=f"{key}_y")
+        st.caption(f"图片尺寸：{w} × {h} px")
 
-    rois = []
-    if result.json_data:
-        for obj in result.json_data.get("objects", []):
-            if obj.get("type") != "rect":
-                continue
-            # canvas coords → image coords
-            x0 = int(obj["left"] / scale)
-            y0 = int(obj["top"] / scale)
-            x1 = int((obj["left"] + obj["width"]) / scale)
-            y1 = int((obj["top"] + obj["height"]) / scale)
-            # clamp
-            x0, x1 = max(0, x0), min(w, x1)
-            y0, y1 = max(0, y0), min(h, y1)
-            if x1 > x0 and y1 > y0:
-                rois.append((x0, y0, x1, y1))
+    x0_g, x1_g = x_range
+    y0_g, y1_g = y_range
+    lane_w = max(1, (x1_g - x0_g) // n)
+    rois = [(x0_g + i * lane_w, y0_g, x0_g + (i + 1) * lane_w, y1_g) for i in range(n)]
+
+    # Live preview
+    preview = img_bgr.copy()
+    for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
+        cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), (0, 200, 80), 2)
+        cv2.putText(preview, f"L{i+1}", (rx0 + 4, ry0 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 80), 2)
+    with c2:
+        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+
     return rois
 
 def show_result_images(img_bgr, annotated_bgr, enhanced, bbox, note=""):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     ann_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    disp = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    disp    = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     gx0, gy0, gx1, gy1 = bbox
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -182,18 +171,15 @@ if mode == "单膜分析":
         st.stop()
 
     if manual:
-        rois = canvas_selector(img, key="s1")
-        if not rois:
-            st.info("请在图片上拖框标记每条泳道，框好后结果自动显示。")
-            st.stop()
+        rois = slider_selector(img, key="s1")
         with st.spinner("分析中…"):
             annotated, df = analyze_rois(img, rois, radius=radius)
-        enh = preprocess(img, radius)
+        enh  = preprocess(img, radius)
         bbox = (0, 0, img.shape[1], img.shape[0])
     else:
         with st.spinner("分析中…"):
             annotated, df, bbox = run_auto(img, n_bands=1)
-        gx0,gy0,gx1,gy1 = bbox
+        gx0, gy0, gx1, gy1 = bbox
         enh = preprocess(img[gy0:gy1, gx0:gx1], radius)
 
     st.divider()
@@ -214,7 +200,6 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
 
     img_t = load_image(up_t)
     img_r = load_image(up_r)
-
     if img_t is None or img_r is None:
         st.info("请分别上传目的蛋白图片和内参图片。")
         st.stop()
@@ -223,21 +208,16 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         st.subheader("框选泳道")
         c1, c2 = st.columns(2)
         with c1:
-            rois_t = canvas_selector(img_t, key="t2c", label="目的蛋白图片")
+            rois_t = slider_selector(img_t, key="t2s", label="目的蛋白图片")
         with c2:
-            rois_r = canvas_selector(img_r, key="r2c", label="内参图片")
-
-        if not rois_t or not rois_r:
-            st.info("请在两张图片上分别框选泳道。")
-            st.stop()
-
+            rois_r = slider_selector(img_r, key="r2s", label="内参图片")
         with st.spinner("分析中…"):
             ann_t, df_t = analyze_rois(img_t, rois_t, radius=radius)
             ann_r, df_r = analyze_rois(img_r, rois_r, radius=radius)
         enh_t = preprocess(img_t, radius)
         enh_r = preprocess(img_r, radius)
-        bbox_t = (0,0,img_t.shape[1],img_t.shape[0])
-        bbox_r = (0,0,img_r.shape[1],img_r.shape[0])
+        bbox_t = (0, 0, img_t.shape[1], img_t.shape[0])
+        bbox_r = (0, 0, img_r.shape[1], img_r.shape[0])
     else:
         with st.spinner("分析中…"):
             ann_t, df_t, bbox_t = run_auto(img_t, n_bands=1)
@@ -278,33 +258,27 @@ else:
 
     if manual:
         st.subheader("框选泳道")
-        st.markdown("请分别框选**目的蛋白**条带区域和**内参**条带区域（各框一次，每条泳道画一个框）")
+        st.markdown("请分别为**目的蛋白**和**内参**各设置一组框选区域")
         tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
         with tab_tgt:
-            rois_t = canvas_selector(img, key="s3t", label="目的蛋白条带（每条泳道框一个）")
+            rois_t = slider_selector(img, key="s3t", label="目的蛋白条带区域")
         with tab_ref:
-            rois_r = canvas_selector(img, key="s3r", label="内参条带（每条泳道框一个）")
-
-        if not rois_t or not rois_r:
-            st.info("请在两个标签页中分别框选目的蛋白和内参的条带区域。")
-            st.stop()
-
+            rois_r = slider_selector(img, key="s3r", label="内参条带区域")
         with st.spinner("分析中…"):
             ann_t, df_t = analyze_rois(img, rois_t, radius=radius)
             ann_r, df_r = analyze_rois(img, rois_r, radius=radius)
-        enh = preprocess(img, radius)
-        bbox = (0,0,img.shape[1],img.shape[0])
 
-        # Merge annotated images
+        # Merge both sets of boxes onto one annotated image
         annotated = img.copy()
         for i, (x0,y0,x1,y1) in enumerate(sorted(rois_t, key=lambda r:r[0])):
             cv2.rectangle(annotated,(x0,y0),(x1,y1),(0,200,80),2)
-            cv2.putText(annotated,f"T{i+1}",(x0+4,y0+18),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,200,80),2)
+            cv2.putText(annotated,f"T{i+1}",(x0+4,y0+20),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,200,80),2)
         for i, (x0,y0,x1,y1) in enumerate(sorted(rois_r, key=lambda r:r[0])):
             cv2.rectangle(annotated,(x0,y0),(x1,y1),(0,180,255),2)
-            cv2.putText(annotated,f"R{i+1}",(x0+4,y0+18),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2)
+            cv2.putText(annotated,f"R{i+1}",(x0+4,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2)
+        enh  = preprocess(img, radius)
+        bbox = (0, 0, img.shape[1], img.shape[0])
     else:
-        target_pos = target_pos if "target_pos" in dir() else "上方条带（分子量较大）"
         with st.spinner("分析中（检测每泳道前两强条带）…"):
             annotated, df_all, bbox = run_auto(img, n_bands=2)
         gx0,gy0,gx1,gy1 = bbox
@@ -318,7 +292,6 @@ else:
     st.divider()
 
     cols = ["Lane","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
-
     if df_t.empty or df_r.empty:
         st.warning("部分泳道条带不足，请调整参数或改用手动框选。")
     else:
@@ -331,6 +304,6 @@ else:
         base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
         excel_download({
             "目的蛋白": df_t[cols] if "Band" in df_t.columns else df_t,
-            "内参": df_r[cols] if "Band" in df_r.columns else df_r,
+            "内参":     df_r[cols] if "Band" in df_r.columns else df_r,
             "对比结果": merged,
         }, base)
