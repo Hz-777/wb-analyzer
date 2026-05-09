@@ -62,115 +62,197 @@ def preprocess(img_bgr: np.ndarray, radius: int = 50) -> np.ndarray:
     return diff
 
 
+def _col_projection(enhanced: np.ndarray) -> np.ndarray:
+    """Column-wise intensity sum focused on the band rows (top-40% signal rows).
+
+    Ignoring background rows keeps the inter-lane gap signal sharp.
+    """
+    row_sums = enhanced.sum(axis=1).astype(float)
+    band_mask = row_sums >= np.percentile(row_sums, 60)
+    src = enhanced[band_mask] if band_mask.sum() > 3 else enhanced
+    return src.sum(axis=0).astype(float)
+
+
+def _detrend(profile: np.ndarray, w: int) -> np.ndarray:
+    """Two-scale detrend: remove slow background drift, keep sharp lane peaks."""
+    norm   = profile / (profile.max() + 1e-9)
+    k_fine = max(3, w // 60)
+    k_base = max(3, w // 6)          # wide baseline — must span several lanes
+    smooth = np.convolve(norm, np.ones(k_fine) / k_fine, mode="same")
+    base   = np.convolve(norm, np.ones(k_base) / k_base, mode="same")
+    return np.clip(smooth - base * 0.35, 0, None)
+
+
+def _find_peaks_adaptive(
+    profile: np.ndarray,
+    n_target: int | None,
+    sensitivity: float,
+) -> np.ndarray:
+    """Peak detection with two separate strategies for auto vs. forced mode.
+
+    Auto mode (n_target=None):
+        Single stable pass — avoids over-detection by keeping minimum distance
+        proportional to the expected lane count.
+
+    Forced mode (n_target given):
+        Progressive search — gradually loosens distance + height thresholds
+        until exactly n_target peaks are found, then selects top-N by prominence.
+    """
+    w       = len(profile)
+    col_max = profile.max()
+    if col_max == 0:
+        return np.array([], dtype=int)
+
+    signal = _detrend(profile, w)
+    sig_max = signal.max()
+    if sig_max == 0:
+        return np.array([], dtype=int)
+
+    if n_target is None:
+        # ── Auto mode: single conservative pass ───────────────────────────
+        dist  = max(5, w // 30)
+        h_thr = sig_max * sensitivity
+        pks, _ = find_peaks(signal, height=h_thr, distance=dist,
+                             prominence=h_thr * 0.3)
+        return pks
+
+    # ── Forced mode: progressively relax until we get n_target peaks ──────
+    for dist_factor in [1.0, 0.70, 0.50, 0.35, 0.22, 0.13]:
+        dist = max(3, int(w * dist_factor / n_target))
+        for sens_f in [1.0, 0.75, 0.55, 0.40, 0.25, 0.15]:
+            h_thr = sig_max * sensitivity * sens_f
+            pks, props = find_peaks(signal, height=h_thr, distance=dist,
+                                    prominence=h_thr * 0.2)
+            if len(pks) >= n_target:
+                prom = props.get("prominences", signal[pks])
+                idx  = np.argsort(prom)[::-1][:n_target]
+                return np.sort(pks[idx])
+
+    # Still not enough — return whatever we have
+    return np.array([], dtype=int)
+
+
+def _uniform_peaks(
+    profile: np.ndarray,
+    detected: np.ndarray,
+    n_lanes: int,
+) -> np.ndarray:
+    """When we can't find n_lanes peaks, enforce uniform spacing.
+
+    Strategy (in priority order):
+      1. If ≥2 peaks detected: extrapolate using median spacing.
+      2. Otherwise: divide the high-signal region evenly.
+    """
+    w = len(profile)
+    if len(detected) >= 2:
+        spacing = int(np.median(np.diff(detected)))
+        center  = int(np.mean(detected))
+        start   = center - spacing * (n_lanes - 1) // 2
+        peaks   = np.array([start + i * spacing for i in range(n_lanes)])
+        return np.clip(peaks, 0, w - 1)
+
+    # Fall back to signal-region division
+    sig_cols = np.where(profile > profile.max() * 0.08)[0]
+    x0 = int(sig_cols[0])  if len(sig_cols) else 0
+    x1 = int(sig_cols[-1]) if len(sig_cols) else w - 1
+    spacing = (x1 - x0) // n_lanes
+    return np.array([x0 + spacing // 2 + i * spacing for i in range(n_lanes)])
+
+
+def _peaks_to_boundaries(peaks: np.ndarray, w: int) -> list[tuple[int, int]]:
+    """Convert lane-center x positions to (left, right) boundary pairs."""
+    boundaries = []
+    for i, pk in enumerate(peaks):
+        left  = (peaks[i - 1] + pk) // 2 if i > 0 \
+                else max(0, pk - (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk)
+        right = (pk + peaks[i + 1]) // 2 if i < len(peaks) - 1 \
+                else min(w, pk + (pk - peaks[i - 1]) // 2 if i > 0 else w)
+        boundaries.append((int(left), int(right)))
+    return boundaries
+
+
 def detect_lanes(
     enhanced: np.ndarray,
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect vertical lane boundaries via horizontal intensity projection.
+    """Detect vertical lane boundaries with multi-scale adaptive peak finding.
 
-    Key improvement: project only the rows that actually contain bands
-    (top-40% by row-sum), so the narrow gaps between lanes create clear
-    valleys rather than being swamped by flat background rows.
+    Steps:
+      1. Project only band rows → sharp inter-lane gaps.
+      2. Detrend with two-scale smoothing to remove background drift.
+      3. Progressively relax distance + sensitivity until n_lanes peaks found.
+      4. If still short: extrapolate from detected spacing (uniform enforcement).
     """
-    # ── Focus projection on band rows ──────────────────────────────────────
-    row_sums = enhanced.sum(axis=1).astype(float)
-    band_threshold = np.percentile(row_sums, 60)   # top 40 % of rows
-    band_mask = row_sums >= band_threshold
-    src = enhanced[band_mask] if band_mask.sum() > 3 else enhanced
-    col_profile = src.sum(axis=0).astype(float)
+    w = enhanced.shape[1]
+    col_profile = _col_projection(enhanced)
 
-    # ── Smooth with a narrower kernel so adjacent lanes stay distinct ──────
-    smooth_k = max(3, len(col_profile) // 80)      # tighter than before
-    col_smooth = np.convolve(col_profile, np.ones(smooth_k) / smooth_k, mode="same")
+    if col_profile.max() == 0:
+        return [(0, w)]
 
-    col_max = col_smooth.max()
-    if col_max == 0:
-        return [(0, enhanced.shape[1])]
+    peaks = _find_peaks_adaptive(col_profile, n_lanes, sensitivity)
 
-    height     = col_max * sensitivity
-    # Minimum distance between lanes: image_width / (expected_lanes * 2)
-    # Use a smaller default so closely-spaced lanes are not merged.
-    distance   = max(5, len(col_smooth) // 40)
-    prominence = col_max * sensitivity * 0.3       # lower prominence threshold
-
-    peaks, props = find_peaks(col_smooth, height=height, distance=distance, prominence=prominence)
-
-    # ── If n_lanes specified, force exactly that many ──────────────────────
-    if n_lanes is not None:
-        if len(peaks) == 0 or len(peaks) < n_lanes:
-            # Fall back: divide the non-zero column range evenly
-            nonzero_cols = np.where(col_smooth > col_max * 0.1)[0]
-            if len(nonzero_cols) == 0:
-                nonzero_cols = np.arange(enhanced.shape[1])
-            x_start, x_end = int(nonzero_cols[0]), int(nonzero_cols[-1]) + 1
-            step = (x_end - x_start) // n_lanes
-            return [(x_start + i * step, x_start + (i + 1) * step) for i in range(n_lanes)]
-        if len(peaks) > n_lanes:
-            prom = props.get("prominences", col_smooth[peaks])
-            idx  = np.argsort(prom)[::-1][:n_lanes]
-            peaks = np.sort(peaks[idx])
+    if n_lanes is not None and len(peaks) != n_lanes:
+        peaks = _uniform_peaks(col_profile, peaks, n_lanes)
 
     if len(peaks) == 0:
-        return [(0, enhanced.shape[1])]
+        return [(0, w)]
 
-    # ── Build lane boundaries from peak midpoints ──────────────────────────
-    w = enhanced.shape[1]
-    boundaries = []
-    for i, pk in enumerate(peaks):
-        if i == 0:
-            half = (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk
-            left = max(0, pk - half)
-        else:
-            left = (peaks[i - 1] + pk) // 2
-        if i == len(peaks) - 1:
-            half = (pk - peaks[i - 1]) // 2 if i > 0 else w - pk
-            right = min(w, pk + half)
-        else:
-            right = (pk + peaks[i + 1]) // 2
-        boundaries.append((int(left), int(right)))
-
-    return boundaries
+    return _peaks_to_boundaries(peaks, w)
 
 
 def detect_bands(
     lane_enhanced: np.ndarray,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect horizontal band positions within a single lane.
+    """Detect horizontal band positions using FWHM-style boundary expansion.
 
-    Band boundaries are determined by signal drop-off rather than a fixed
-    half-width, producing much tighter ROI boxes around actual bands.
+    For each peak:
+      - Walk outward from the peak until signal drops below 30 % of peak value
+        OR rises again (entering the next band's territory).
+      - Add a 1-pixel padding so the full band is included.
     """
     row_profile = lane_enhanced.sum(axis=1).astype(float)
+    h = lane_enhanced.shape[0]
 
-    smooth_k = max(3, len(row_profile) // 30)
-    row_smooth = np.convolve(row_profile, np.ones(smooth_k) / smooth_k, mode="same")
+    # Two-scale smooth: fine for peaks, coarse for baseline removal
+    k_fine = max(3, h // 30)
+    k_base = max(3, h // 8)
+    smooth = np.convolve(row_profile, np.ones(k_fine) / k_fine, mode="same")
+    base   = np.convolve(row_profile, np.ones(k_base) / k_base, mode="same")
+    signal = np.clip(smooth - base * 0.3, 0, None)
 
-    threshold = row_smooth.max() * sensitivity
-    distance = max(5, len(row_smooth) // 15)
+    if signal.max() == 0:
+        return []
 
-    peaks, _ = find_peaks(row_smooth, height=threshold, distance=distance, prominence=threshold * 0.3)
+    threshold = signal.max() * sensitivity
+    distance  = max(5, h // 15)
+    peaks, _  = find_peaks(signal, height=threshold, distance=distance,
+                            prominence=threshold * 0.25)
 
     if len(peaks) == 0:
         return []
 
-    h = lane_enhanced.shape[0]
     bands = []
     for pk in peaks:
-        peak_val = row_smooth[pk]
-        # Band edge = where the signal drops below 25 % of its peak value
-        edge_thresh = max(threshold * 0.4, peak_val * 0.25)
+        pk_val     = signal[pk]
+        edge_thr   = max(threshold * 0.35, pk_val * 0.30)
 
+        # Walk up (decreasing y)
         y0 = pk
-        while y0 > 0 and row_smooth[y0 - 1] >= edge_thresh:
+        while y0 > 0 and signal[y0 - 1] >= edge_thr and signal[y0 - 1] <= signal[y0]:
             y0 -= 1
 
+        # Walk down (increasing y)
         y1 = pk
-        while y1 < h - 1 and row_smooth[y1 + 1] >= edge_thresh:
+        while y1 < h - 1 and signal[y1 + 1] >= edge_thr and signal[y1 + 1] <= signal[y1]:
             y1 += 1
 
-        bands.append((int(max(0, y0)), int(min(h, y1 + 1))))
+        # 1-pixel padding
+        y0 = max(0,     y0 - 1)
+        y1 = min(h - 1, y1 + 1)
+
+        bands.append((int(y0), int(y1 + 1)))
 
     return bands
 
