@@ -4,17 +4,60 @@ from scipy.signal import find_peaks
 import pandas as pd
 
 
+def find_gel_bbox(gray: np.ndarray) -> tuple[int, int, int, int]:
+    """Auto-detect the membrane/gel bounding box by removing the black border.
+
+    Works for dark-background chemiluminescence images (ChemiDoc etc.) where
+    the membrane is a large bright rectangle surrounded by black.
+    Returns (x0, y0, x1, y1) in original image coordinates.
+    """
+    h, w = gray.shape
+
+    # Adaptive threshold: anything brighter than 5% of max is considered "gel"
+    thresh_val = max(8, int(gray.max() * 0.05))
+    _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+
+    # Erode aggressively to kill small calibration markers / corner artifacts
+    erode_px = max(15, min(w, h) // 25)
+    kernel_e = cv2.getStructuringElement(cv2.MORPH_RECT, (erode_px, erode_px))
+    eroded = cv2.erode(mask, kernel_e, iterations=3)
+
+    if eroded.sum() == 0:
+        # Fallback: use full image
+        return (0, 0, w, h)
+
+    # Dilate back to restore the membrane extent
+    kernel_d = cv2.getStructuringElement(cv2.MORPH_RECT, (erode_px * 2, erode_px * 2))
+    restored = cv2.dilate(eroded, kernel_d, iterations=2)
+
+    # Bounding box of the restored region
+    coords = cv2.findNonZero(restored)
+    if coords is None:
+        return (0, 0, w, h)
+
+    x, y, bw, bh = cv2.boundingRect(coords)
+    # Small safety margin
+    pad = 5
+    return (
+        max(0, x - pad),
+        max(0, y - pad),
+        min(w, x + bw + pad),
+        min(h, y + bh + pad),
+    )
+
+
 def preprocess(img_bgr: np.ndarray, radius: int = 50) -> np.ndarray:
-    """Convert to grayscale and subtract background (light background mode, like ImageJ step 3-4)."""
+    """Grayscale → background subtraction (light-background mode, like ImageJ steps 3-4).
+
+    Result: bands become bright pixels on dark background.
+    """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Rolling ball via morphological opening: estimates the bright background
     kernel_size = int(radius * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     background = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
 
-    # For light background: background - original → bands become bright, bg → 0
-    # This is equivalent to ImageJ "Subtract Background (Light bg)" + "Invert"
+    # background - original: dark bands become bright, bright bg → 0
     diff = cv2.subtract(background, gray)
     return diff
 
@@ -24,40 +67,31 @@ def detect_lanes(
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect vertical lane boundaries by horizontal intensity projection."""
+    """Detect vertical lane boundaries via horizontal intensity projection."""
     col_profile = enhanced.sum(axis=0).astype(float)
 
-    # Smooth the profile
-    kernel_size = max(3, len(col_profile) // 50)
-    col_profile_smooth = np.convolve(
-        col_profile, np.ones(kernel_size) / kernel_size, mode="same"
-    )
+    smooth_k = max(3, len(col_profile) // 50)
+    col_smooth = np.convolve(col_profile, np.ones(smooth_k) / smooth_k, mode="same")
 
-    threshold = col_profile_smooth.max() * sensitivity
-    height = col_profile_smooth.max() * sensitivity
-    distance = max(10, len(col_profile) // 20)
+    height = col_smooth.max() * sensitivity
+    distance = max(10, len(col_smooth) // 20)
+    prominence = col_smooth.max() * sensitivity * 0.5
 
-    peaks, props = find_peaks(
-        col_profile_smooth, height=height, distance=distance, prominence=threshold * 0.5
-    )
+    peaks, props = find_peaks(col_smooth, height=height, distance=distance, prominence=prominence)
 
     if n_lanes is not None and len(peaks) != n_lanes:
-        # Force exactly n_lanes by taking top-N peaks by prominence
         if len(peaks) == 0:
-            # No peaks found; divide image evenly
-            w = enhanced.shape[1]
-            step = w // n_lanes
+            step = enhanced.shape[1] // n_lanes
             return [(i * step, (i + 1) * step) for i in range(n_lanes)]
-        prominences = props.get("prominences", col_profile_smooth[peaks])
-        idx = np.argsort(prominences)[::-1][:n_lanes]
+        prom = props.get("prominences", col_smooth[peaks])
+        idx = np.argsort(prom)[::-1][:n_lanes]
         peaks = np.sort(peaks[idx])
 
     if len(peaks) == 0:
         return [(0, enhanced.shape[1])]
 
-    # Build lane boundaries: midpoints between adjacent peaks
-    boundaries = []
     w = enhanced.shape[1]
+    boundaries = []
     for i, pk in enumerate(peaks):
         left = (peaks[i - 1] + pk) // 2 if i > 0 else max(0, pk - (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk // 2)
         right = (pk + peaks[i + 1]) // 2 if i < len(peaks) - 1 else min(w, pk + (pk - peaks[i - 1]) // 2 if i > 0 else w)
@@ -70,54 +104,37 @@ def detect_bands(
     lane_enhanced: np.ndarray,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect horizontal bands within a lane by vertical intensity projection."""
+    """Detect horizontal band positions within a single lane."""
     row_profile = lane_enhanced.sum(axis=1).astype(float)
 
-    kernel_size = max(3, len(row_profile) // 30)
-    row_profile_smooth = np.convolve(
-        row_profile, np.ones(kernel_size) / kernel_size, mode="same"
-    )
+    smooth_k = max(3, len(row_profile) // 30)
+    row_smooth = np.convolve(row_profile, np.ones(smooth_k) / smooth_k, mode="same")
 
-    threshold = row_profile_smooth.max() * sensitivity
-    distance = max(5, len(row_profile) // 15)
+    threshold = row_smooth.max() * sensitivity
+    distance = max(5, len(row_smooth) // 15)
 
-    peaks, _ = find_peaks(
-        row_profile_smooth, height=threshold, distance=distance, prominence=threshold * 0.3
-    )
+    peaks, _ = find_peaks(row_smooth, height=threshold, distance=distance, prominence=threshold * 0.3)
 
     if len(peaks) == 0:
         return []
 
-    bands = []
     h = lane_enhanced.shape[0]
-    for i, pk in enumerate(peaks):
-        # Band region: half-width defined by where profile falls below 30% of peak value
-        half_width = distance // 2
-        y0 = max(0, pk - half_width)
-        y1 = min(h, pk + half_width)
-        bands.append((int(y0), int(y1)))
-
-    return bands
+    half = distance // 2
+    return [(int(max(0, pk - half)), int(min(h, pk + half))) for pk in peaks]
 
 
-def measure_roi(
-    enhanced: np.ndarray, x0: int, x1: int, y0: int, y1: int
-) -> dict:
-    """Measure Area, Mean, Min, Max, IntDen for a rectangular ROI."""
+def measure_roi(enhanced: np.ndarray, x0: int, x1: int, y0: int, y1: int) -> dict:
+    """Compute Area, Mean, Min, Max, IntDen, RawIntDen for a rectangular ROI."""
     roi = enhanced[y0:y1, x0:x1].astype(float)
     area = roi.size
     mean_val = roi.mean() if area > 0 else 0.0
-    min_val = roi.min() if area > 0 else 0.0
-    max_val = roi.max() if area > 0 else 0.0
-    int_den = area * mean_val  # ImageJ IntDen = Area × Mean
-    raw_int_den = roi.sum()    # ImageJ RawIntDen = sum of pixel values
     return {
         "Area": int(area),
         "Mean": round(float(mean_val), 3),
-        "Min": round(float(min_val), 1),
-        "Max": round(float(max_val), 1),
-        "IntDen": round(float(int_den), 1),
-        "RawIntDen": round(float(raw_int_den), 1),
+        "Min": round(float(roi.min()) if area > 0 else 0.0, 1),
+        "Max": round(float(roi.max()) if area > 0 else 0.0, 1),
+        "IntDen": round(float(area * mean_val), 1),
+        "RawIntDen": round(float(roi.sum()), 1),
     }
 
 
@@ -127,12 +144,24 @@ def analyze(
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
     strongest_only: bool = True,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """Full pipeline: preprocess → detect lanes → detect bands → measure → return annotated image + DataFrame.
+    auto_crop: bool = True,
+) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int]]:
+    """Full pipeline. Returns (annotated_full_image, results_df, gel_bbox).
 
-    strongest_only: if True, keep only the band with highest IntDen per lane (ignore non-specific bands).
+    auto_crop: detect and crop to the membrane region before analysis,
+               fixing dark-background images (ChemiDoc etc.) where the
+               black border confuses lane detection.
     """
-    enhanced = preprocess(img_bgr, radius)
+    gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    if auto_crop:
+        gx0, gy0, gx1, gy1 = find_gel_bbox(gray_full)
+        img_crop = img_bgr[gy0:gy1, gx0:gx1]
+    else:
+        gx0, gy0, gx1, gy1 = 0, 0, img_bgr.shape[1], img_bgr.shape[0]
+        img_crop = img_bgr
+
+    enhanced = preprocess(img_crop, radius)
     lanes = detect_lanes(enhanced, n_lanes=n_lanes, sensitivity=sensitivity)
 
     annotated = img_bgr.copy()
@@ -142,39 +171,44 @@ def analyze(
         lane_img = enhanced[:, x0:x1]
         bands = detect_bands(lane_img, sensitivity=sensitivity)
 
-        # Fall back: measure the entire lane column if no bands found
         if not bands:
             bands = [(0, enhanced.shape[0])]
 
-        # Measure all candidate bands first
         candidates = []
         for y0, y1 in bands:
             metrics = measure_roi(enhanced, x0, x1, y0, y1)
             candidates.append((y0, y1, metrics))
 
-        # Keep only the strongest band per lane if requested
         if strongest_only and len(candidates) > 1:
             candidates = [max(candidates, key=lambda c: c[2]["IntDen"])]
 
+        color = (0, 200, 80) if strongest_only else (0, 220, 220)
+
         for band_idx, (y0, y1, metrics) in enumerate(candidates):
+            # Translate coordinates back to full image space
+            abs_x0, abs_x1 = gx0 + x0, gx0 + x1
+            abs_y0, abs_y1 = gy0 + y0, gy0 + y1
+
             rows.append({
                 "Lane": lane_idx + 1,
                 "Band": band_idx + 1,
-                "X_start": x0,
-                "X_end": x1,
-                "Y_start": y0,
-                "Y_end": y1,
+                "X_start": abs_x0,
+                "X_end": abs_x1,
+                "Y_start": abs_y0,
+                "Y_end": abs_y1,
                 **metrics,
             })
-            # Draw rectangle: green for strongest-only mode, yellow for all-bands mode
-            color = (0, 200, 80) if strongest_only else (0, 220, 220)
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
-            label = f"L{lane_idx + 1}"
+
+            cv2.rectangle(annotated, (abs_x0, abs_y0), (abs_x1, abs_y1), color, 2)
             cv2.putText(
-                annotated, label,
-                (x0 + 4, y0 + 18),
+                annotated, f"L{lane_idx + 1}",
+                (abs_x0 + 4, abs_y0 + 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
             )
 
+    # Draw gel bounding box in blue so user can verify the crop
+    if auto_crop:
+        cv2.rectangle(annotated, (gx0, gy0), (gx1, gy1), (255, 120, 0), 2)
+
     df = pd.DataFrame(rows)
-    return annotated, df
+    return annotated, df, (gx0, gy0, gx1, gy1)
