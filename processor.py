@@ -338,24 +338,42 @@ def measure_roi(enhanced: np.ndarray, x0: int, x1: int,
                 y0: int, y1: int) -> dict:
     """Area / Mean / Min / Max / IntDen / RawIntDen on the enhanced image.
 
-    Mean and IntDen are Gaussian column-weighted so the lane centre
-    contributes more than the edges.  RawIntDen is the plain pixel sum
-    (matches ImageJ's RawIntDen for cross-reference).
+    Mean and IntDen combine two corrections:
+      1. Gaussian column weighting  — lane centre > edges (bleed-through suppression)
+      2. Local background subtraction — strips above + below the band (non-specific signal)
+    RawIntDen is the plain unweighted pixel sum for ImageJ cross-reference.
     """
-    roi  = enhanced[y0:y1, x0:x1].astype(float)
-    area = roi.size
+    roi    = enhanced[y0:y1, x0:x1].astype(float)
+    area   = roi.size
     if area == 0:
         return {"Area": 0, "Mean": 0.0, "Min": 0.0, "Max": 0.0,
                 "IntDen": 0.0, "RawIntDen": 0.0}
 
-    # Gaussian-weighted mean: per-column means → dot with Gaussian weights
-    w = roi.shape[1]
-    if w >= 3:
-        gauss    = _gaussian_col_weights(w)
-        col_mean = roi.mean(axis=0)           # shape (w,) — one mean per column
-        mean_val = float(np.dot(col_mean, gauss))
-    else:
-        mean_val = float(roi.mean())
+    h_full = enhanced.shape[0]
+    w      = roi.shape[1]
+    gauss  = _gaussian_col_weights(w) if w >= 3 else None
+
+    def _wmean(patch: np.ndarray) -> float:
+        """Gaussian-weighted column mean of a 2-D patch (same width as roi)."""
+        if gauss is not None and patch.shape[1] == w:
+            return float(np.dot(patch.mean(axis=0), gauss))
+        return float(patch.mean())
+
+    mean_val = _wmean(roi)
+
+    # ── Local background: strips immediately above and below the band ──────
+    # Height = half the band height (min 2 px).  Gaussian-weighted to match.
+    bg_h   = max(2, (y1 - y0) // 2)
+    bg_parts: list[np.ndarray] = []
+    if y0 - bg_h >= 0:
+        bg_parts.append(enhanced[y0 - bg_h : y0, x0:x1].astype(float))
+    if y1 + bg_h <= h_full:
+        bg_parts.append(enhanced[y1 : y1 + bg_h, x0:x1].astype(float))
+
+    if bg_parts:
+        bg_patch = np.concatenate(bg_parts, axis=0)
+        bg_mean  = _wmean(bg_patch)
+        mean_val = max(0.0, mean_val - bg_mean)
 
     return {
         "Area":      int(area),
@@ -365,6 +383,100 @@ def measure_roi(enhanced: np.ndarray, x0: int, x1: int,
         "IntDen":    round(area * mean_val, 1),
         "RawIntDen": round(float(roi.sum()), 1),
     }
+
+
+# ════════════════════════ profile fusion helpers ═════════════════════
+
+def get_enhanced_and_profile(
+    img_bgr: np.ndarray,
+    radius: int = 50,
+    auto_crop: bool = True,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
+    """Return (enhanced_crop, col_profile, gel_bbox).
+
+    Used to prepare column profiles before dual-image fusion so both
+    images contribute to lane detection.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if auto_crop:
+        gx0, gy0, gx1, gy1 = find_gel_bbox(gray)
+    else:
+        gx0, gy0, gx1, gy1 = 0, 0, img_bgr.shape[1], img_bgr.shape[0]
+    img_crop  = img_bgr[gy0:gy1, gx0:gx1]
+    enhanced  = preprocess(img_crop, radius)
+    cw        = enhanced.shape[1]
+    col_raw   = enhanced.sum(axis=0).astype(float)
+    col_prof  = _smooth(col_raw, max(3, cw // 60))
+    return enhanced, col_prof, (gx0, gy0, gx1, gy1)
+
+
+def fuse_col_profiles(prof_a: np.ndarray, prof_b: np.ndarray) -> np.ndarray:
+    """Normalize two column profiles to [0, 1] at a common length, then average.
+
+    Resamples the shorter profile to the longer one's length so both images
+    contribute equally regardless of width differences.
+    """
+    L  = max(len(prof_a), len(prof_b))
+    xa = np.linspace(0.0, 1.0, len(prof_a))
+    xb = np.linspace(0.0, 1.0, len(prof_b))
+    xo = np.linspace(0.0, 1.0, L)
+    na = np.interp(xo, xa, prof_a / max(float(prof_a.max()), 1.0))
+    nb = np.interp(xo, xb, prof_b / max(float(prof_b.max()), 1.0))
+    return (na + nb) * 0.5
+
+
+def dual_lane_bounds(
+    img_bgr_a: np.ndarray,
+    img_bgr_b: np.ndarray,
+    radius: int = 50,
+    n_lanes: int | None = None,
+    sensitivity: float = 0.3,
+    auto_crop: bool = True,
+    gap_frac: float = 0.15,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]],
+           tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Detect lanes from the fused column profiles of two gel images.
+
+    Both images are preprocessed independently, their column profiles are
+    normalised and averaged, then lane regions are detected once on the fused
+    profile.  The resulting relative positions are mapped back to each image's
+    own crop-coordinate space.
+
+    Returns (bounds_a, bounds_b, bbox_a, bbox_b).
+    """
+    _, prof_a, bbox_a = get_enhanced_and_profile(img_bgr_a, radius, auto_crop)
+    _, prof_b, bbox_b = get_enhanced_and_profile(img_bgr_b, radius, auto_crop)
+
+    fused = fuse_col_profiles(prof_a, prof_b)
+    L     = len(fused)
+
+    # Lane detection on the fused profile
+    if n_lanes is not None:
+        peaks = _find_n_peaks(fused, n_lanes, sensitivity)
+        if len(peaks) == n_lanes:
+            bounds_fused = _peaks_to_equal_boundaries(peaks, L, gap_frac)
+        else:
+            sig          = np.where(fused > fused.max() * 0.1)[0]
+            x0s          = int(sig[0])  if len(sig) else 0
+            x1s          = int(sig[-1]) if len(sig) else L - 1
+            bounds_fused = _uniform_split(x0s, x1s, n_lanes, img_w=L)
+    else:
+        bounds_fused = _lane_regions_from_profile(fused, gap_frac)
+        if len(bounds_fused) < 2:
+            peaks        = _find_auto_peaks(fused, sensitivity)
+            peaks        = _merge_doublet_peaks(peaks)
+            bounds_fused = (_peaks_to_equal_boundaries(peaks, L, gap_frac)
+                            if len(peaks) >= 2 else [(0, L - 1)])
+
+    # Map relative positions to each image's crop width
+    wa = len(prof_a)
+    wb = len(prof_b)
+    bounds_a = [(int(x0 * wa / L), min(wa - 1, int(x1 * wa / L)))
+                for x0, x1 in bounds_fused]
+    bounds_b = [(int(x0 * wb / L), min(wb - 1, int(x1 * wb / L)))
+                for x0, x1 in bounds_fused]
+
+    return bounds_a, bounds_b, bbox_a, bbox_b
 
 
 # ════════════════════════ manual ROI mode ════════════════════════════
@@ -404,13 +516,17 @@ def analyze(
     auto_crop: bool = True,
     skip_first_lane: bool = False,
     skip_last_lane: bool = False,
+    lane_bounds_override: list[tuple[int, int]] | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int], np.ndarray]:
     """Projection-based WB quantification pipeline.
 
     All detection runs on the bright-band enhanced image:
-      • Column projection  → lane x-positions
+      • Column projection  → lane x-positions  (skipped if lane_bounds_override given)
       • Row projection     → band y-positions (FWHM boundaries)
-      • measure_roi        → IntDen on enhanced
+      • measure_roi        → IntDen (Gaussian-weighted + local background corrected)
+
+    lane_bounds_override: pre-computed (x0, x1) list in crop-coordinate space,
+      used by dual_lane_bounds() to pass fused detection results directly.
 
     Returns (annotated_img, df, gel_bbox, enhanced_crop).
     """
@@ -430,45 +546,41 @@ def analyze(
     ch, cw   = enhanced.shape
 
     # ── 3. Lane x-detection via column projection ─────────────────────
-    # Use the full column sum so that valleys between lanes are preserved even
-    # when bands span the whole gel height.  Sharpening via top-20 % rows is
-    # blended in for images where it helps (i.e. adds more peaks, not fewer).
-    col_raw = enhanced.sum(axis=0).astype(float)
-    col_profile = _smooth(col_raw, max(3, cw // 60))
-
-    # Also try the sharpened profile (only top-20 % brightest rows).
-    row_sums = enhanced.sum(axis=1).astype(float)
-    if (row_sums > 0).any():
-        pct80 = np.percentile(row_sums[row_sums > 0], 80)
-        bright_rows = row_sums >= pct80
-        if bright_rows.sum() >= 3:
-            col_sharp = _smooth(enhanced[bright_rows].sum(axis=0).astype(float),
-                                max(3, cw // 60))
-            # Prefer whichever profile has more peaks (= better lane separation)
-            auto_raw   = _find_auto_peaks(col_profile, sensitivity)
-            auto_sharp = _find_auto_peaks(col_sharp,   sensitivity)
-            if len(auto_sharp) > len(auto_raw):
-                col_profile = col_sharp
-
-    if n_lanes is not None:
-        lane_peaks = _find_n_peaks(col_profile, n_lanes, sensitivity)
-        if len(lane_peaks) == n_lanes:
-            lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw)
-        else:
-            # Peaks not found → use extent of significant columns
-            sig_cols = np.where(col_profile > col_profile.max() * 0.1)[0]
-            x0_sig   = int(sig_cols[0])  if len(sig_cols) else 0
-            x1_sig   = int(sig_cols[-1]) if len(sig_cols) else cw
-            lane_bounds = _uniform_split(x0_sig, x1_sig, n_lanes, img_w=cw)
+    if lane_bounds_override is not None:
+        # Pre-computed bounds (e.g. from dual_lane_bounds fusion) — use directly
+        lane_bounds = list(lane_bounds_override)
     else:
-        # Primary: connected-region analysis (exploits the rectangular lane shape)
-        lane_bounds = _lane_regions_from_profile(col_profile)
-        if len(lane_bounds) < 2:
-            # Fallback: peak-based with doublet merging
-            lane_peaks  = _find_auto_peaks(col_profile, sensitivity)
-            lane_peaks  = _merge_doublet_peaks(lane_peaks)
-            lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw) \
-                          if len(lane_peaks) >= 2 else [(0, cw)]
+        col_raw     = enhanced.sum(axis=0).astype(float)
+        col_profile = _smooth(col_raw, max(3, cw // 60))
+
+        # Also try sharpened profile (top-20 % brightest rows).
+        row_sums = enhanced.sum(axis=1).astype(float)
+        if (row_sums > 0).any():
+            pct80       = np.percentile(row_sums[row_sums > 0], 80)
+            bright_rows = row_sums >= pct80
+            if bright_rows.sum() >= 3:
+                col_sharp  = _smooth(
+                    enhanced[bright_rows].sum(axis=0).astype(float), max(3, cw // 60))
+                if len(_find_auto_peaks(col_sharp, sensitivity)) > \
+                   len(_find_auto_peaks(col_profile, sensitivity)):
+                    col_profile = col_sharp
+
+        if n_lanes is not None:
+            lane_peaks = _find_n_peaks(col_profile, n_lanes, sensitivity)
+            if len(lane_peaks) == n_lanes:
+                lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw)
+            else:
+                sig_cols    = np.where(col_profile > col_profile.max() * 0.1)[0]
+                x0_sig      = int(sig_cols[0])  if len(sig_cols) else 0
+                x1_sig      = int(sig_cols[-1]) if len(sig_cols) else cw
+                lane_bounds = _uniform_split(x0_sig, x1_sig, n_lanes, img_w=cw)
+        else:
+            lane_bounds = _lane_regions_from_profile(col_profile)
+            if len(lane_bounds) < 2:
+                lane_peaks  = _find_auto_peaks(col_profile, sensitivity)
+                lane_peaks  = _merge_doublet_peaks(lane_peaks)
+                lane_bounds = (_peaks_to_equal_boundaries(lane_peaks, cw)
+                               if len(lane_peaks) >= 2 else [(0, cw)])
 
     # ── 4. Skip marker lanes ──────────────────────────────────────────
     if skip_first_lane and len(lane_bounds) > 1:

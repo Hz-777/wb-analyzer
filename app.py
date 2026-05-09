@@ -6,7 +6,7 @@ import streamlit as st
 from PIL import Image as PILImage
 
 from streamlit_image_coordinates import streamlit_image_coordinates
-from processor import analyze, analyze_rois
+from processor import analyze, analyze_rois, dual_lane_bounds
 
 st.set_page_config(page_title="WB 条带自动定量", page_icon="🧬", layout="wide")
 st.title("🧬 Western Blot 条带灰度值自动定量")
@@ -305,15 +305,28 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         bbox_t = (0, 0, img_t.shape[1], img_t.shape[0])
         bbox_r = (0, 0, img_r.shape[1], img_r.shape[0])
     else:
-        with st.spinner("分析中（目的蛋白）…"):
-            ann_t, df_t, bbox_t, enh_t = run_auto(img_t, n_bands=1)
-        n_sync = df_t["Lane"].nunique()
-        with st.spinner(f"分析中（内参，同步泳道数 = {n_sync}）…"):
-            ann_r, df_r, bbox_r, enh_r = run_auto(img_r, n_bands=1,
-                                                   force_n_lanes=n_sync)
-        if df_r["Lane"].nunique() != n_sync:
-            st.warning(f"⚠️ 内参泳道数检测异常，已强制对齐至 {n_sync} 条。"
-                       "如结果不佳请改用手动框选。")
+        n_forced = None if auto_lanes else int(n_lanes)
+        with st.spinner("融合两图列轮廓，检测泳道…"):
+            bounds_t, bounds_r, bbox_t, bbox_r = dual_lane_bounds(
+                img_t, img_r,
+                radius=radius, n_lanes=n_forced,
+                sensitivity=sensitivity, auto_crop=auto_crop,
+            )
+        n_sync = len(bounds_t)
+        st.caption(f"🔗 融合检测：**{n_sync}** 条泳道（目的蛋白 + 内参共同确定，x 坐标对齐）")
+        with st.spinner("分析中…"):
+            ann_t, df_t, bbox_t, enh_t = analyze(
+                img_t, radius=radius, n_bands_per_lane=1,
+                auto_crop=auto_crop,
+                skip_first_lane=skip_first, skip_last_lane=skip_last,
+                lane_bounds_override=bounds_t,
+            )
+            ann_r, df_r, bbox_r, enh_r = analyze(
+                img_r, radius=radius, n_bands_per_lane=1,
+                auto_crop=auto_crop,
+                skip_first_lane=skip_first, skip_last_lane=skip_last,
+                lane_bounds_override=bounds_r,
+            )
 
     st.divider()
     st.subheader("目的蛋白")
