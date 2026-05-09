@@ -317,7 +317,7 @@ def analyze_rois(
         cv2.putText(annotated, f"L{i + 1}", (x0 + 4, y0 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 80), 2)
 
-    return annotated, pd.DataFrame(rows)
+    return annotated, pd.DataFrame(rows), enhanced
 
 
 # ════════════════════════ full pipeline ══════════════════════════════
@@ -457,4 +457,4 @@ def analyze(
     if auto_crop:
         cv2.rectangle(annotated, (gx0, gy0), (gx1, gy1), (255, 120, 0), 2)
 
-    return annotated, pd.DataFrame(rows), (gx0, gy0, gx1, gy1)
+    return annotated, pd.DataFrame(rows), (gx0, gy0, gx1, gy1), enhanced

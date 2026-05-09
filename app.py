@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image as PILImage
 
-from processor import analyze, analyze_rois, preprocess
+from processor import analyze, analyze_rois
 
 st.set_page_config(page_title="WB 条带自动定量", page_icon="🧬", layout="wide")
 st.title("🧬 Western Blot 条带灰度值自动定量")
@@ -69,7 +69,7 @@ def load_image(uploaded) -> np.ndarray | None:
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 def run_auto(img_bgr, n_bands=1):
-    return analyze(
+    annotated, df, bbox, enhanced = analyze(
         img_bgr, radius=radius,
         n_lanes=None if auto_lanes else int(n_lanes),
         sensitivity=sensitivity,
@@ -78,6 +78,7 @@ def run_auto(img_bgr, n_bands=1):
         skip_first_lane=skip_first,
         skip_last_lane=skip_last,
     )
+    return annotated, df, bbox, enhanced
 
 def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
     """Uniform-box manual lane selection.
@@ -158,17 +159,33 @@ def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tupl
     return rois
 
 def show_result_images(img_bgr, annotated_bgr, enhanced, bbox, note=""):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    ann_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    disp    = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    """Show original | bright-band preprocessed | detection in 3 columns.
+
+    The preprocessed panel embeds the enhanced (bright-band) crop back into a
+    full-size dark canvas so the gel region is clearly visible in context.
+    Bright pixels = strong band signal; black = background / outside gel.
+    """
+    h, w = img_bgr.shape[:2]
     gx0, gy0, gx1, gy1 = bbox
+
+    # ── Build full-size bright-band display ───────────────────────────
+    enh_norm = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    disp_full = np.zeros((h, w), dtype=np.uint8)
+    ch = min(gy1 - gy0, enh_norm.shape[0])
+    cw = min(gx1 - gx0, enh_norm.shape[1])
+    disp_full[gy0:gy0 + ch, gx0:gx0 + cw] = enh_norm[:ch, :cw]
+
+    img_rgb = cv2.cvtColor(img_bgr,      cv2.COLOR_BGR2RGB)
+    ann_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"**原始图片** {note}")
         st.image(img_rgb, use_container_width=True)
     with c2:
-        st.markdown(f"**预处理结果** {note}")
-        st.image(disp, use_container_width=True, clamp=True)
+        st.markdown(f"**预处理结果（亮带 = 强信号）** {note}")
+        st.caption("灰度转换 + 背景去除后：条带越亮 = 蛋白含量越高，IntDen 在此图像上计算")
+        st.image(disp_full, use_container_width=True, clamp=True)
     with c3:
         st.markdown(f"**检测结果** {note}")
         if not manual and auto_crop:
@@ -220,14 +237,11 @@ if mode == "单膜分析":
     if manual:
         rois = manual_selector(img, key="s1")
         with st.spinner("分析中…"):
-            annotated, df = analyze_rois(img, rois, radius=radius)
-        enh  = preprocess(img, radius)
+            annotated, df, enh = analyze_rois(img, rois, radius=radius)
         bbox = (0, 0, img.shape[1], img.shape[0])
     else:
         with st.spinner("分析中…"):
-            annotated, df, bbox = run_auto(img, n_bands=1)
-        gx0, gy0, gx1, gy1 = bbox
-        enh = preprocess(img[gy0:gy1, gx0:gx1], radius)
+            annotated, df, bbox, enh = run_auto(img, n_bands=1)
 
     st.divider()
     show_result_images(img, annotated, enh, bbox)
@@ -259,20 +273,14 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         with c2:
             rois_r = manual_selector(img_r, key="r2s", label="内参图片")
         with st.spinner("分析中…"):
-            ann_t, df_t = analyze_rois(img_t, rois_t, radius=radius)
-            ann_r, df_r = analyze_rois(img_r, rois_r, radius=radius)
-        enh_t = preprocess(img_t, radius)
-        enh_r = preprocess(img_r, radius)
+            ann_t, df_t, enh_t = analyze_rois(img_t, rois_t, radius=radius)
+            ann_r, df_r, enh_r = analyze_rois(img_r, rois_r, radius=radius)
         bbox_t = (0, 0, img_t.shape[1], img_t.shape[0])
         bbox_r = (0, 0, img_r.shape[1], img_r.shape[0])
     else:
         with st.spinner("分析中…"):
-            ann_t, df_t, bbox_t = run_auto(img_t, n_bands=1)
-            ann_r, df_r, bbox_r = run_auto(img_r, n_bands=1)
-        gx0,gy0,gx1,gy1 = bbox_t
-        enh_t = preprocess(img_t[gy0:gy1,gx0:gx1], radius)
-        gx0,gy0,gx1,gy1 = bbox_r
-        enh_r = preprocess(img_r[gy0:gy1,gx0:gx1], radius)
+            ann_t, df_t, bbox_t, enh_t = run_auto(img_t, n_bands=1)
+            ann_r, df_r, bbox_r, enh_r = run_auto(img_r, n_bands=1)
 
     st.divider()
     st.subheader("目的蛋白")
@@ -312,8 +320,8 @@ else:
         with tab_ref:
             rois_r = manual_selector(img, key="s3r", label="内参条带区域")
         with st.spinner("分析中…"):
-            ann_t, df_t = analyze_rois(img, rois_t, radius=radius)
-            ann_r, df_r = analyze_rois(img, rois_r, radius=radius)
+            ann_t, df_t, enh_t = analyze_rois(img, rois_t, radius=radius)
+            ann_r, df_r, enh   = analyze_rois(img, rois_r, radius=radius)
 
         # Merge both sets of boxes onto one annotated image
         annotated = img.copy()
@@ -323,13 +331,10 @@ else:
         for i, (x0,y0,x1,y1) in enumerate(sorted(rois_r, key=lambda r:r[0])):
             cv2.rectangle(annotated,(x0,y0),(x1,y1),(0,180,255),2)
             cv2.putText(annotated,f"R{i+1}",(x0+4,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2)
-        enh  = preprocess(img, radius)
         bbox = (0, 0, img.shape[1], img.shape[0])
     else:
         with st.spinner("分析中（检测每泳道前两强条带）…"):
-            annotated, df_all, bbox = run_auto(img, n_bands=2)
-        gx0,gy0,gx1,gy1 = bbox
-        enh = preprocess(img[gy0:gy1,gx0:gx1], radius)
+            annotated, df_all, bbox, enh = run_auto(img, n_bands=2)
         target_band_no = 1 if "上方" in target_pos else 2
         df_t = df_all[df_all["Band"] == target_band_no].copy()
         df_r = df_all[df_all["Band"] == (3 - target_band_no)].copy()
