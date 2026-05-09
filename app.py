@@ -55,7 +55,7 @@ with st.sidebar:
     st.markdown("**使用说明**")
     st.markdown(
         "1. 上传 WB 原始图片\n"
-        "2. 暗背景图片请勾选"自动裁剪到胶体区域"\n"
+        "2. 暗背景图片请勾选『自动裁剪到胶体区域』\n"
         "3. 调整参数直到检测结果准确\n"
         "4. 下载 Excel 结果文件"
     )
@@ -120,7 +120,7 @@ st.divider()
 st.subheader(f"定量结果（共检测到 {len(df)} 个条带）")
 
 if df.empty:
-    st.warning("未检测到任何条带，请尝试：降低检测灵敏度、调整背景去除半径，或取消勾选"自动裁剪"后手动观察。")
+    st.warning("未检测到任何条带，请尝试：降低检测灵敏度、调整背景去除半径，或取消勾选『自动裁剪』后手动观察。")
 else:
     display_cols = ["Lane", "Band", "Area", "Mean", "Min", "Max", "IntDen", "RawIntDen"]
     st.dataframe(
