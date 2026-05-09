@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0e1117;
+    color: #fafafa;
+    font-family: "Source Sans Pro", sans-serif;
+    user-select: none;
+  }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 4px;
+    border-bottom: 1px solid #2a2a3a;
+    margin-bottom: 4px;
+  }
+
+  button {
+    background: #262730;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 3px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  button:hover { background: #3a3a4a; color: #fff; }
+  button.danger { border-color: #933; color: #f88; }
+  button.danger:hover { background: #3a1515; }
+
+  #info {
+    font-size: 12px;
+    color: #888;
+    flex: 1;
+  }
+
+  #canvas-wrap { position: relative; line-height: 0; }
+
+  canvas {
+    display: block;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="clearBtn" class="danger">🗑 清空</button>
+  <span id="info">在图片上拖动鼠标画框，双击框可删除</span>
+</div>
+<div id="canvas-wrap">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script src="https://unpkg.com/streamlit-component-lib@2.0.0/dist/index.js"></script>
+<script>
+"use strict";
+
+const canvas  = document.getElementById("canvas");
+const ctx     = canvas.getContext("2d");
+const clearBtn = document.getElementById("clearBtn");
+const info    = document.getElementById("info");
+
+const img = new Image();
+let rects = [];          // [{x0,y0,x1,y1}] in ORIGINAL image coords
+let dragging = false;
+let sx = 0, sy = 0, cx = 0, cy = 0;  // canvas-space drag coords
+let scaleX = 1, scaleY = 1;          // canvas-px → original-px
+
+/* ── coordinate helpers ──────────────────────────────────────────────── */
+function toOrig(canvX, canvY) {
+  return {
+    x: Math.round(Math.max(0, Math.min(canvas.width  - 1, canvX)) * scaleX),
+    y: Math.round(Math.max(0, Math.min(canvas.height - 1, canvY)) * scaleY),
+  };
+}
+function toCanv(origX, origY) {
+  return { x: origX / scaleX, y: origY / scaleY };
+}
+
+/* ── drawing ─────────────────────────────────────────────────────────── */
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (img.complete && img.naturalWidth > 0)
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  // Finished rects
+  rects.forEach((r, i) => {
+    const a = toCanv(r.x0, r.y0), b = toCanv(r.x1, r.y1);
+    const rw = b.x - a.x, rh = b.y - a.y;
+
+    ctx.fillStyle   = "rgba(0,220,80,0.12)";
+    ctx.strokeStyle = "#00dc50";
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.rect(a.x, a.y, rw, rh);
+    ctx.fill(); ctx.stroke();
+
+    // Label top-left
+    ctx.font      = "bold 13px sans-serif";
+    ctx.fillStyle = "#00dc50";
+    ctx.fillText("L" + (i + 1), a.x + 4, a.y + 16);
+
+    // Coord hint bottom-left
+    ctx.font      = "10px sans-serif";
+    ctx.fillStyle = "rgba(0,220,80,0.75)";
+    ctx.fillText(
+      r.x0 + "," + r.y0 + " – " + r.x1 + "," + r.y1,
+      a.x + 4, b.y - 4
+    );
+  });
+
+  // In-progress rect
+  if (dragging) {
+    const x = Math.min(sx, cx), y = Math.min(sy, cy);
+    const w = Math.abs(cx - sx), h = Math.abs(cy - sy);
+    const o0 = toOrig(x, y), o1 = toOrig(x + w, y + h);
+
+    ctx.fillStyle   = "rgba(255,215,0,0.08)";
+    ctx.strokeStyle = "#ffd700";
+    ctx.lineWidth   = 1.5;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath(); ctx.rect(x, y, w, h);
+    ctx.fill(); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Live coord label
+    ctx.font      = "11px sans-serif";
+    ctx.fillStyle = "#ffd700";
+    ctx.fillText(o0.x + "," + o0.y + " → " + o1.x + "," + o1.y, x + 2, Math.max(14, y - 4));
+  }
+}
+
+/* ── mouse events ────────────────────────────────────────────────────── */
+function canvasXY(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+canvas.addEventListener("mousedown", e => {
+  const p = canvasXY(e);
+  sx = p.x; sy = p.y; cx = p.x; cy = p.y;
+  dragging = true;
+});
+
+canvas.addEventListener("mousemove", e => {
+  if (!dragging) return;
+  const p = canvasXY(e);
+  cx = p.x; cy = p.y;
+  redraw();
+});
+
+canvas.addEventListener("mouseup", e => {
+  if (!dragging) return;
+  dragging = false;
+  const p = canvasXY(e);
+  cx = p.x; cy = p.y;
+
+  const o0 = toOrig(Math.min(sx, cx), Math.min(sy, cy));
+  const o1 = toOrig(Math.max(sx, cx), Math.max(sy, cy));
+
+  if (o1.x - o0.x > 4 && o1.y - o0.y > 4) {
+    rects.push({ x0: o0.x, y0: o0.y, x1: o1.x, y1: o1.y });
+    Streamlit.setComponentValue(rects);
+    info.textContent = "✅ 已画 " + rects.length + " 个框（双击框可删除）";
+  }
+  redraw();
+});
+
+// Double-click: delete the rect under cursor
+canvas.addEventListener("dblclick", e => {
+  const p = canvasXY(e);
+  const before = rects.length;
+  rects = rects.filter(r => {
+    const a = toCanv(r.x0, r.y0), b = toCanv(r.x1, r.y1);
+    return !(p.x >= a.x && p.x <= b.x && p.y >= a.y && p.y <= b.y);
+  });
+  if (rects.length < before) {
+    Streamlit.setComponentValue(rects);
+    info.textContent = rects.length > 0
+      ? "✅ 已画 " + rects.length + " 个框（双击框可删除）"
+      : "在图片上拖动鼠标画框，双击框可删除";
+  }
+  redraw();
+});
+
+clearBtn.addEventListener("click", () => {
+  rects = [];
+  Streamlit.setComponentValue(rects);
+  info.textContent = "在图片上拖动鼠标画框，双击框可删除";
+  redraw();
+});
+
+/* ── Streamlit lifecycle ─────────────────────────────────────────────── */
+function onRender(event) {
+  const args = event.detail.args;
+
+  const dw  = args.displayWidth || 760;
+  const ow  = args.origWidth;
+  const oh  = args.origHeight;
+  const dh  = Math.round(oh * dw / ow);
+
+  canvas.width  = dw;
+  canvas.height = dh;
+  scaleX = ow / dw;
+  scaleY = oh / dh;
+
+  const src = "data:image/jpeg;base64," + args.imageB64;
+  if (img.src !== src) {
+    img.onload = () => { redraw(); Streamlit.setFrameHeight(dh + 46); };
+    img.src = src;
+  } else {
+    redraw();
+    Streamlit.setFrameHeight(dh + 46);
+  }
+}
+
+Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+Streamlit.setComponentReady();
+</script>
+</body>
+</html>
