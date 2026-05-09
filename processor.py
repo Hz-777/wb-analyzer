@@ -67,34 +67,67 @@ def detect_lanes(
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect vertical lane boundaries via horizontal intensity projection."""
-    col_profile = enhanced.sum(axis=0).astype(float)
+    """Detect vertical lane boundaries via horizontal intensity projection.
 
-    smooth_k = max(3, len(col_profile) // 50)
+    Key improvement: project only the rows that actually contain bands
+    (top-40% by row-sum), so the narrow gaps between lanes create clear
+    valleys rather than being swamped by flat background rows.
+    """
+    # ── Focus projection on band rows ──────────────────────────────────────
+    row_sums = enhanced.sum(axis=1).astype(float)
+    band_threshold = np.percentile(row_sums, 60)   # top 40 % of rows
+    band_mask = row_sums >= band_threshold
+    src = enhanced[band_mask] if band_mask.sum() > 3 else enhanced
+    col_profile = src.sum(axis=0).astype(float)
+
+    # ── Smooth with a narrower kernel so adjacent lanes stay distinct ──────
+    smooth_k = max(3, len(col_profile) // 80)      # tighter than before
     col_smooth = np.convolve(col_profile, np.ones(smooth_k) / smooth_k, mode="same")
 
-    height = col_smooth.max() * sensitivity
-    distance = max(10, len(col_smooth) // 20)
-    prominence = col_smooth.max() * sensitivity * 0.5
+    col_max = col_smooth.max()
+    if col_max == 0:
+        return [(0, enhanced.shape[1])]
+
+    height     = col_max * sensitivity
+    # Minimum distance between lanes: image_width / (expected_lanes * 2)
+    # Use a smaller default so closely-spaced lanes are not merged.
+    distance   = max(5, len(col_smooth) // 40)
+    prominence = col_max * sensitivity * 0.3       # lower prominence threshold
 
     peaks, props = find_peaks(col_smooth, height=height, distance=distance, prominence=prominence)
 
-    if n_lanes is not None and len(peaks) != n_lanes:
-        if len(peaks) == 0:
-            step = enhanced.shape[1] // n_lanes
-            return [(i * step, (i + 1) * step) for i in range(n_lanes)]
-        prom = props.get("prominences", col_smooth[peaks])
-        idx = np.argsort(prom)[::-1][:n_lanes]
-        peaks = np.sort(peaks[idx])
+    # ── If n_lanes specified, force exactly that many ──────────────────────
+    if n_lanes is not None:
+        if len(peaks) == 0 or len(peaks) < n_lanes:
+            # Fall back: divide the non-zero column range evenly
+            nonzero_cols = np.where(col_smooth > col_max * 0.1)[0]
+            if len(nonzero_cols) == 0:
+                nonzero_cols = np.arange(enhanced.shape[1])
+            x_start, x_end = int(nonzero_cols[0]), int(nonzero_cols[-1]) + 1
+            step = (x_end - x_start) // n_lanes
+            return [(x_start + i * step, x_start + (i + 1) * step) for i in range(n_lanes)]
+        if len(peaks) > n_lanes:
+            prom = props.get("prominences", col_smooth[peaks])
+            idx  = np.argsort(prom)[::-1][:n_lanes]
+            peaks = np.sort(peaks[idx])
 
     if len(peaks) == 0:
         return [(0, enhanced.shape[1])]
 
+    # ── Build lane boundaries from peak midpoints ──────────────────────────
     w = enhanced.shape[1]
     boundaries = []
     for i, pk in enumerate(peaks):
-        left = (peaks[i - 1] + pk) // 2 if i > 0 else max(0, pk - (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk // 2)
-        right = (pk + peaks[i + 1]) // 2 if i < len(peaks) - 1 else min(w, pk + (pk - peaks[i - 1]) // 2 if i > 0 else w)
+        if i == 0:
+            half = (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk
+            left = max(0, pk - half)
+        else:
+            left = (peaks[i - 1] + pk) // 2
+        if i == len(peaks) - 1:
+            half = (pk - peaks[i - 1]) // 2 if i > 0 else w - pk
+            right = min(w, pk + half)
+        else:
+            right = (pk + peaks[i + 1]) // 2
         boundaries.append((int(left), int(right)))
 
     return boundaries
