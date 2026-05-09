@@ -80,73 +80,80 @@ def run_auto(img_bgr, n_bands=1):
     )
 
 def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
-    """Precise manual lane selection with coordinate guide + text input.
+    """Uniform-box manual lane selection.
 
-    Shows a ruler overlay so the user can read pixel positions, then lets them
-    type the exact x-boundaries of every lane and the y-range of the band row.
+    User specifies the CENTER x of each lane + a single box width that applies
+    to every lane, guaranteeing all ROIs are exactly the same size so that
+    Area and IntDen values are directly comparable.
     """
     h, w = img_bgr.shape[:2]
     if label:
         st.markdown(f"**{label}**")
 
-    # ── Draw coordinate ruler on top of image ─────────────────────────────
+    # ── Coordinate ruler overlay ───────────────────────────────────────────
     guide = img_bgr.copy()
-    tick_step = max(20, round(w / 30 / 10) * 10)   # sensible tick interval
+    tick_step = max(20, round(w / 30 / 10) * 10)
     for x in range(0, w + 1, tick_step):
         is_major = (x % (tick_step * 5) == 0)
-        tick_h   = 18 if is_major else 10
-        color    = (30, 30, 200)
-        cv2.line(guide, (x, 0), (x, tick_h), color, 1)
+        cv2.line(guide, (x, 0), (x, 18 if is_major else 10), (30, 30, 200), 1)
         if is_major:
             cv2.putText(guide, str(x), (max(0, x - 12), 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
-    # Horizontal ruler baseline
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (30, 30, 200), 1)
     cv2.line(guide, (0, 1), (w, 1), (30, 30, 200), 1)
     st.image(cv2.cvtColor(guide, cv2.COLOR_BGR2RGB), use_container_width=True)
-    st.caption(f"📐 图片尺寸：{w} × {h} px  |  蓝色刻度为 x 坐标（每 {tick_step} px 一小格）")
+    st.caption(f"📐 图片尺寸：{w} × {h} px  ｜  蓝色刻度为 x 坐标（每 {tick_step} px 一格）")
 
-    # ── Input controls ─────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns([2, 1, 1])
+    # ── Controls ───────────────────────────────────────────────────────────
+    c1, c2 = st.columns([3, 2])
     with c1:
         n = st.number_input("泳道数量", 1, 30, 6, 1, key=f"{key}_n")
-        default_xs = ",".join(str(round(w * i / n)) for i in range(n + 1))
-        x_input = st.text_input(
-            f"泳道 X 边界（{n + 1} 个值，逗号分隔：最左边界, 各分界线, 最右边界）",
-            value=default_xs,
-            key=f"{key}_x",
-            help="从刻度尺读取每条泳道左右边界的 x 像素值，共需填写泳道数+1 个数字。",
+        default_centers = ", ".join(
+            str(round(w * (2 * i + 1) / (2 * n))) for i in range(n)
+        )
+        centers_input = st.text_input(
+            f"每条泳道中心 x 坐标（{n} 个值，逗号分隔）",
+            value=default_centers,
+            key=f"{key}_cx",
+            help="从刻度尺读取每条泳道正中心的 x 像素值，填 n 个数字。",
         )
     with c2:
-        y0 = st.number_input("条带上边界 y", 0, h - 1, h // 4, key=f"{key}_y0",
-                             help="从刻度尺顶端往下数，条带顶部的 y 坐标。")
-    with c3:
-        y1 = st.number_input("条带下边界 y", 1, h, h * 3 // 4, key=f"{key}_y1",
-                             help="条带底部的 y 坐标。")
+        default_bw = max(10, round(w / n * 0.7 / 5) * 5)
+        box_w = st.number_input(
+            "统一框宽（像素）", 5, w, default_bw, 5, key=f"{key}_bw",
+            help="所有泳道使用相同的框宽，保证 Area 一致、IntDen 可比。",
+        )
+        y0 = st.number_input("条带上边界 y", 0, h - 1, h // 4, key=f"{key}_y0")
+        y1 = st.number_input("条带下边界 y", 1, h,     h * 3 // 4, key=f"{key}_y1")
 
-    # ── Parse x-boundaries ────────────────────────────────────────────────
+    # ── Parse centers ──────────────────────────────────────────────────────
     rois: list[tuple[int,int,int,int]] = []
     try:
-        xs = [int(v.strip()) for v in x_input.split(",") if v.strip()]
+        centers = [int(v.strip()) for v in centers_input.split(",") if v.strip()]
     except ValueError:
         st.error("格式有误，请输入整数，以英文逗号分隔。")
-        xs = []
+        centers = []
 
-    if xs:
-        if len(xs) != n + 1:
-            st.warning(f"需要 {n + 1} 个 x 值（{n} 条泳道 + 最右边界），当前填写了 {len(xs)} 个。")
+    if centers:
+        if len(centers) != n:
+            st.warning(f"需要 {n} 个中心坐标，当前填写了 {len(centers)} 个。")
         else:
-            rois = [(xs[i], int(y0), xs[i + 1], int(y1)) for i in range(n)]
+            half = box_w // 2
+            iy0, iy1 = int(y0), int(y1)
+            rois = [(max(0, cx - half), iy0, min(w, cx + half), iy1)
+                    for cx in centers]
 
     # ── Live preview ───────────────────────────────────────────────────────
     if rois:
+        box_h = int(y1) - int(y0)
         preview = img_bgr.copy()
         for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
             cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), (0, 200, 80), 2)
             cv2.putText(preview, f"L{i + 1}", (rx0 + 4, ry0 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 80), 2)
         st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.success(f"✅ 所有框尺寸一致：宽 {box_w} × 高 {box_h} px  ｜  共 {n} 条泳道")
     else:
-        st.info("填写完整的 x 坐标后，框选预览将显示在此处。")
+        st.info("填写完整的中心坐标后，预览将显示在此处。")
 
     return rois
 
