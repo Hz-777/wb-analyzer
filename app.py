@@ -79,34 +79,74 @@ def run_auto(img_bgr, n_bands=1):
         skip_last_lane=skip_last,
     )
 
-def slider_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
-    """Slider-based manual lane selection. Returns list of (x0,y0,x1,y1) ROIs."""
+def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
+    """Precise manual lane selection with coordinate guide + text input.
+
+    Shows a ruler overlay so the user can read pixel positions, then lets them
+    type the exact x-boundaries of every lane and the y-range of the band row.
+    """
     h, w = img_bgr.shape[:2]
     if label:
         st.markdown(f"**{label}**")
 
-    c1, c2 = st.columns([1, 2])
+    # ── Draw coordinate ruler on top of image ─────────────────────────────
+    guide = img_bgr.copy()
+    tick_step = max(20, round(w / 30 / 10) * 10)   # sensible tick interval
+    for x in range(0, w + 1, tick_step):
+        is_major = (x % (tick_step * 5) == 0)
+        tick_h   = 18 if is_major else 10
+        color    = (30, 30, 200)
+        cv2.line(guide, (x, 0), (x, tick_h), color, 1)
+        if is_major:
+            cv2.putText(guide, str(x), (max(0, x - 12), 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+    # Horizontal ruler baseline
+    cv2.line(guide, (0, 1), (w, 1), (30, 30, 200), 1)
+    st.image(cv2.cvtColor(guide, cv2.COLOR_BGR2RGB), use_container_width=True)
+    st.caption(f"📐 图片尺寸：{w} × {h} px  |  蓝色刻度为 x 坐标（每 {tick_step} px 一小格）")
+
+    # ── Input controls ─────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         n = st.number_input("泳道数量", 1, 30, 6, 1, key=f"{key}_n")
-        x_range = st.slider("水平范围（覆盖所有泳道）", 0, w, (max(0, w//10), min(w, w*9//10)),
-                            key=f"{key}_x")
-        y_range = st.slider("垂直范围（框住条带行）", 0, h, (max(0, h//5), min(h, h*4//5)),
-                            key=f"{key}_y")
-        st.caption(f"图片尺寸：{w} × {h} px")
-
-    x0_g, x1_g = x_range
-    y0_g, y1_g = y_range
-    lane_w = max(1, (x1_g - x0_g) // n)
-    rois = [(x0_g + i * lane_w, y0_g, x0_g + (i + 1) * lane_w, y1_g) for i in range(n)]
-
-    # Live preview
-    preview = img_bgr.copy()
-    for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
-        cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), (0, 200, 80), 2)
-        cv2.putText(preview, f"L{i+1}", (rx0 + 4, ry0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 80), 2)
+        default_xs = ",".join(str(round(w * i / n)) for i in range(n + 1))
+        x_input = st.text_input(
+            f"泳道 X 边界（{n + 1} 个值，逗号分隔：最左边界, 各分界线, 最右边界）",
+            value=default_xs,
+            key=f"{key}_x",
+            help="从刻度尺读取每条泳道左右边界的 x 像素值，共需填写泳道数+1 个数字。",
+        )
     with c2:
+        y0 = st.number_input("条带上边界 y", 0, h - 1, h // 4, key=f"{key}_y0",
+                             help="从刻度尺顶端往下数，条带顶部的 y 坐标。")
+    with c3:
+        y1 = st.number_input("条带下边界 y", 1, h, h * 3 // 4, key=f"{key}_y1",
+                             help="条带底部的 y 坐标。")
+
+    # ── Parse x-boundaries ────────────────────────────────────────────────
+    rois: list[tuple[int,int,int,int]] = []
+    try:
+        xs = [int(v.strip()) for v in x_input.split(",") if v.strip()]
+    except ValueError:
+        st.error("格式有误，请输入整数，以英文逗号分隔。")
+        xs = []
+
+    if xs:
+        if len(xs) != n + 1:
+            st.warning(f"需要 {n + 1} 个 x 值（{n} 条泳道 + 最右边界），当前填写了 {len(xs)} 个。")
+        else:
+            rois = [(xs[i], int(y0), xs[i + 1], int(y1)) for i in range(n)]
+
+    # ── Live preview ───────────────────────────────────────────────────────
+    if rois:
+        preview = img_bgr.copy()
+        for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
+            cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), (0, 200, 80), 2)
+            cv2.putText(preview, f"L{i + 1}", (rx0 + 4, ry0 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 80), 2)
         st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+    else:
+        st.info("填写完整的 x 坐标后，框选预览将显示在此处。")
 
     return rois
 
@@ -171,7 +211,7 @@ if mode == "单膜分析":
         st.stop()
 
     if manual:
-        rois = slider_selector(img, key="s1")
+        rois = manual_selector(img, key="s1")
         with st.spinner("分析中…"):
             annotated, df = analyze_rois(img, rois, radius=radius)
         enh  = preprocess(img, radius)
@@ -208,9 +248,9 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         st.subheader("框选泳道")
         c1, c2 = st.columns(2)
         with c1:
-            rois_t = slider_selector(img_t, key="t2s", label="目的蛋白图片")
+            rois_t = manual_selector(img_t, key="t2s", label="目的蛋白图片")
         with c2:
-            rois_r = slider_selector(img_r, key="r2s", label="内参图片")
+            rois_r = manual_selector(img_r, key="r2s", label="内参图片")
         with st.spinner("分析中…"):
             ann_t, df_t = analyze_rois(img_t, rois_t, radius=radius)
             ann_r, df_r = analyze_rois(img_r, rois_r, radius=radius)
@@ -261,9 +301,9 @@ else:
         st.markdown("请分别为**目的蛋白**和**内参**各设置一组框选区域")
         tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
         with tab_tgt:
-            rois_t = slider_selector(img, key="s3t", label="目的蛋白条带区域")
+            rois_t = manual_selector(img, key="s3t", label="目的蛋白条带区域")
         with tab_ref:
-            rois_r = slider_selector(img, key="s3r", label="内参条带区域")
+            rois_r = manual_selector(img, key="s3r", label="内参条带区域")
         with st.spinner("分析中…"):
             ann_t, df_t = analyze_rois(img, rois_t, radius=radius)
             ann_r, df_r = analyze_rois(img, rois_r, radius=radius)
