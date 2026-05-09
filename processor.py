@@ -143,14 +143,16 @@ def analyze(
     radius: int = 50,
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
-    strongest_only: bool = True,
+    n_bands_per_lane: int = 1,
     auto_crop: bool = True,
 ) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int]]:
     """Full pipeline. Returns (annotated_full_image, results_df, gel_bbox).
 
-    auto_crop: detect and crop to the membrane region before analysis,
-               fixing dark-background images (ChemiDoc etc.) where the
-               black border confuses lane detection.
+    n_bands_per_lane: how many bands to keep per lane, ranked by IntDen.
+        1 = strongest only (single-protein / dual-membrane mode)
+        2 = top-2 bands (same-membrane target+reference mode)
+        0 = keep all detected bands
+    auto_crop: detect and crop to the membrane region before analysis.
     """
     gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -179,10 +181,14 @@ def analyze(
             metrics = measure_roi(enhanced, x0, x1, y0, y1)
             candidates.append((y0, y1, metrics))
 
-        if strongest_only and len(candidates) > 1:
-            candidates = [max(candidates, key=lambda c: c[2]["IntDen"])]
+        # Sort by IntDen descending, then keep top N (sorted back by Y position)
+        if n_bands_per_lane > 0 and len(candidates) > n_bands_per_lane:
+            candidates = sorted(candidates, key=lambda c: c[2]["IntDen"], reverse=True)[:n_bands_per_lane]
+        # Re-sort by vertical position so Band 1 = top band, Band 2 = bottom band
+        candidates = sorted(candidates, key=lambda c: c[0])
 
-        color = (0, 200, 80) if strongest_only else (0, 220, 220)
+        # Color scheme: green=single band, cyan=top-2 mode
+        color = (0, 200, 80) if n_bands_per_lane == 1 else (0, 220, 220)
 
         for band_idx, (y0, y1, metrics) in enumerate(candidates):
             # Translate coordinates back to full image space
