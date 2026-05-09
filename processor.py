@@ -55,21 +55,40 @@ def preprocess(img_bgr: np.ndarray, radius: int = 50) -> np.ndarray:
 # ════════════════════════ gel bounding box ════════════════════════════
 
 def find_gel_bbox(gray: np.ndarray) -> tuple[int, int, int, int]:
-    """Auto-detect membrane region, removing border / calibration markers."""
+    """Auto-detect membrane region, removing border / calibration markers.
+
+    Strategy:
+      1. Otsu threshold separates the bright membrane from the true black border.
+      2. Erode aggressively to destroy thin L-bracket calibration marks.
+      3. Take the LARGEST surviving connected component — that is the membrane.
+      4. Dilate back and return its bounding box.
+    """
     h, w = gray.shape
     src = gray if detect_image_type(gray) == "dark" else cv2.bitwise_not(gray)
 
+    # Low threshold: include the entire membrane region (grey bg + dark bands within).
+    # We intentionally include L-brackets too — they are removed later by erosion.
     thresh = max(8, int(src.max() * 0.05))
     _, mask = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY)
 
-    px = max(15, min(w, h) // 25)
+    # Erode to kill thin L-brackets and corner artifacts
+    px = max(12, min(w, h) // 30)
     eroded = cv2.erode(mask,
                        cv2.getStructuringElement(cv2.MORPH_RECT, (px, px)),
                        iterations=3)
     if eroded.sum() == 0:
         return (0, 0, w, h)
 
-    restored = cv2.dilate(eroded,
+    # Keep only the LARGEST connected component (= the membrane)
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(eroded, connectivity=8)
+    if n_lab <= 1:
+        return (0, 0, w, h)
+    # stats row 0 = background; find largest foreground component
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    single = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    # Dilate back to restore membrane extents
+    restored = cv2.dilate(single,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (px * 2, px * 2)),
                           iterations=2)
     pts = cv2.findNonZero(restored)
@@ -77,7 +96,7 @@ def find_gel_bbox(gray: np.ndarray) -> tuple[int, int, int, int]:
         return (0, 0, w, h)
 
     x, y, bw, bh = cv2.boundingRect(pts)
-    p = 5
+    p = 4
     return (max(0, x - p), max(0, y - p), min(w, x + bw + p), min(h, y + bh + p))
 
 
@@ -335,29 +354,38 @@ def analyze(
     # ── 3. Threshold → binary band mask ──────────────────────────────
     mask  = _band_mask(enhanced, sensitivity)
 
-    # ── 4. Find contour boxes & group into lanes ──────────────────────
-    boxes  = _find_boxes(mask)
-    groups = _group_into_lanes(boxes, n_lanes, cw) if boxes else []
+    # ── 4. Find contour boxes ─────────────────────────────────────────
+    boxes = _find_boxes(mask)
 
-    # ── 5. Skip marker lanes ──────────────────────────────────────────
-    if skip_first_lane and len(groups) > 1:
-        groups = groups[1:]
-    if skip_last_lane and len(groups) > 1:
-        groups = groups[:-1]
-
-    # ── 6. Compute equal-width lane x-boundaries ──────────────────────
-    if groups and (n_lanes is None or len(groups) >= n_lanes):
-        # Enough groups detected: use their centers for equal-width boundaries
-        boundaries = _lane_boundaries(groups, cw)
-    elif n_lanes is not None:
-        # Fewer groups than requested (bands merged across lanes):
-        # divide the detected signal region evenly into n_lanes slots
-        boundaries = _uniform_lane_split(boxes, n_lanes, cw)
-        groups     = [[]] * n_lanes
+    # ── 5. Determine lane x-boundaries ───────────────────────────────
+    if n_lanes is not None:
+        # User specified lane count → divide the significant signal region
+        # evenly into n_lanes equal columns, ignoring artifact boxes.
+        # "Significant" = at least 15 % of the largest box's area.
+        if boxes:
+            max_area  = max(b[2] * b[3] for b in boxes)
+            sig_boxes = [b for b in boxes if b[2] * b[3] >= max_area * 0.15]
+        else:
+            sig_boxes = []
+        n_eff = n_lanes   # will be trimmed below for skip flags
+        boundaries = _uniform_lane_split(sig_boxes, n_eff, cw)
+        groups     = [[]] * n_eff
     else:
-        # Auto mode with no detections: single lane spanning the image
-        boundaries = [(0, cw)]
-        groups     = [[]]
+        # Auto mode → cluster boxes into lanes by x-position
+        groups = _group_into_lanes(boxes, None, cw) if boxes else []
+        if groups:
+            boundaries = _lane_boundaries(groups, cw)
+        else:
+            boundaries = [(0, cw)]
+            groups     = [[]]
+
+    # ── 6. Skip marker lanes ──────────────────────────────────────────
+    if skip_first_lane and len(boundaries) > 1:
+        boundaries = boundaries[1:]
+        groups     = groups[1:]
+    if skip_last_lane and len(boundaries) > 1:
+        boundaries = boundaries[:-1]
+        groups     = groups[:-1]
 
     # ── 7. Per-lane: find bands, measure, annotate ────────────────────
     annotated = img_bgr.copy()
