@@ -6,10 +6,25 @@ import numpy as np
 import streamlit.components.v1 as components
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
-_component_func = components.declare_component(
-    "wb_roi_canvas",
-    path=os.path.join(_DIR, "frontend"),
+_LOCAL_FRONTEND = os.path.join(_DIR, "frontend")
+
+# On Streamlit Cloud the local path won't serve; use GitHub Pages instead.
+_IS_CLOUD = (
+    not os.path.isdir(_LOCAL_FRONTEND)
+    or os.environ.get("STREAMLIT_SHARING_MODE") is not None
+    or os.environ.get("IS_STREAMLIT_CLOUD") is not None
 )
+
+if _IS_CLOUD:
+    _component_func = components.declare_component(
+        "wb_roi_canvas",
+        url="https://hz-777.github.io/wb-analyzer/",
+    )
+else:
+    _component_func = components.declare_component(
+        "wb_roi_canvas",
+        path=_LOCAL_FRONTEND,
+    )
 
 
 def wb_roi_canvas(
