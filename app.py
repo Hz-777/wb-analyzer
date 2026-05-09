@@ -1,0 +1,148 @@
+import io
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
+from processor import analyze, preprocess
+
+st.set_page_config(
+    page_title="WB 条带自动定量",
+    page_icon="🧬",
+    layout="wide",
+)
+
+st.title("🧬 Western Blot 条带灰度值自动定量")
+st.markdown(
+    "基于 ImageJ 工作流程自动完成：灰度转换 → 背景去除 → 条带检测 → IntDen 计算"
+)
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("参数设置")
+
+    radius = st.slider(
+        "背景去除半径（对应 ImageJ rolling ball radius）",
+        min_value=10, max_value=150, value=50, step=5,
+        help="值越大去除的背景范围越广，与 ImageJ Subtract Background 中的 radius 一致，默认 50。",
+    )
+
+    auto_lanes = st.checkbox("自动检测泳道数", value=True)
+    n_lanes: int | None = None
+    if not auto_lanes:
+        n_lanes = st.number_input("指定泳道数量", min_value=1, max_value=30, value=4, step=1)
+
+    sensitivity = st.slider(
+        "检测灵敏度",
+        min_value=0.05, max_value=0.80, value=0.25, step=0.05,
+        help="数值越低越容易检测到弱条带，但可能产生误报。",
+    )
+
+    st.divider()
+    st.markdown("**使用说明**")
+    st.markdown(
+        "1. 上传 WB 原始图片\n"
+        "2. 调整参数直到检测结果准确\n"
+        "3. 下载 Excel 结果文件"
+    )
+
+# ── Main area ─────────────────────────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "上传 WB 图片（JPG / PNG / TIF）",
+    type=["jpg", "jpeg", "png", "tif", "tiff", "bmp"],
+)
+
+if uploaded is None:
+    st.info("请在左侧上传图片后开始分析。")
+    st.stop()
+
+# Decode image
+file_bytes = np.frombuffer(uploaded.read(), dtype=np.uint8)
+img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+if img_bgr is None:
+    st.error("无法读取图片，请检查文件格式。")
+    st.stop()
+
+# ── Run analysis ──────────────────────────────────────────────────────────────
+with st.spinner("正在分析图片…"):
+    annotated_bgr, df = analyze(
+        img_bgr,
+        radius=radius,
+        n_lanes=None if auto_lanes else int(n_lanes),
+        sensitivity=sensitivity,
+    )
+    enhanced = preprocess(img_bgr, radius=radius)
+
+# Convert images for display (BGR→RGB)
+img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+enhanced_display = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+# ── Image display ──────────────────────────────────────────────────────────────
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.subheader("原始图片")
+    st.image(img_rgb, use_container_width=True)
+
+with col2:
+    st.subheader("预处理结果（背景去除 + 取反）")
+    st.image(enhanced_display, use_container_width=True, clamp=True)
+
+with col3:
+    st.subheader("条带检测结果")
+    st.image(annotated_rgb, use_container_width=True)
+
+# ── Results table ──────────────────────────────────────────────────────────────
+st.divider()
+st.subheader(f"定量结果（共检测到 {len(df)} 个条带）")
+
+if df.empty:
+    st.warning("未检测到任何条带，请尝试降低检测灵敏度或调整参数。")
+else:
+    display_cols = ["Lane", "Band", "Area", "Mean", "Min", "Max", "IntDen", "RawIntDen"]
+    st.dataframe(
+        df[display_cols].style.format({
+            "Area": "{:,}",
+            "Mean": "{:.2f}",
+            "Min": "{:.1f}",
+            "Max": "{:.1f}",
+            "IntDen": "{:,.1f}",
+            "RawIntDen": "{:,.1f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── Download button ────────────────────────────────────────────────────────
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Main results
+        df[display_cols].to_excel(writer, sheet_name="定量结果", index=False)
+
+        # Normalized (relative to lane 1)
+        if len(df) > 1:
+            ref_int_den = df.loc[df["Lane"] == df["Lane"].min(), "IntDen"].values[0]
+            df_norm = df[["Lane", "Band", "IntDen"]].copy()
+            df_norm["Relative_IntDen"] = (df_norm["IntDen"] / ref_int_den).round(4)
+            df_norm.to_excel(writer, sheet_name="相对定量（归一化）", index=False)
+
+    output.seek(0)
+    filename = uploaded.name.rsplit(".", 1)[0] + "_WB_quantification.xlsx"
+    st.download_button(
+        label="⬇️  下载 Excel 结果",
+        data=output,
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # Quick summary
+    st.subheader("IntDen 相对比较（以最小泳道号为基准 = 1）")
+    ref = df.loc[df["Lane"] == df["Lane"].min(), "IntDen"].values[0]
+    summary = df.groupby("Lane")["IntDen"].sum().reset_index()
+    summary.columns = ["泳道", "IntDen 合计"]
+    summary["相对值"] = (summary["IntDen 合计"] / ref).round(4)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.bar_chart(summary.set_index("泳道")["IntDen 合计"])
