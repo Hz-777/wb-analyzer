@@ -137,7 +137,11 @@ def detect_bands(
     lane_enhanced: np.ndarray,
     sensitivity: float = 0.3,
 ) -> list[tuple[int, int]]:
-    """Detect horizontal band positions within a single lane."""
+    """Detect horizontal band positions within a single lane.
+
+    Band boundaries are determined by signal drop-off rather than a fixed
+    half-width, producing much tighter ROI boxes around actual bands.
+    """
     row_profile = lane_enhanced.sum(axis=1).astype(float)
 
     smooth_k = max(3, len(row_profile) // 30)
@@ -152,8 +156,23 @@ def detect_bands(
         return []
 
     h = lane_enhanced.shape[0]
-    half = distance // 2
-    return [(int(max(0, pk - half)), int(min(h, pk + half))) for pk in peaks]
+    bands = []
+    for pk in peaks:
+        peak_val = row_smooth[pk]
+        # Band edge = where the signal drops below 25 % of its peak value
+        edge_thresh = max(threshold * 0.4, peak_val * 0.25)
+
+        y0 = pk
+        while y0 > 0 and row_smooth[y0 - 1] >= edge_thresh:
+            y0 -= 1
+
+        y1 = pk
+        while y1 < h - 1 and row_smooth[y1 + 1] >= edge_thresh:
+            y1 += 1
+
+        bands.append((int(max(0, y0)), int(min(h, y1 + 1))))
+
+    return bands
 
 
 def analyze_rois(
@@ -211,6 +230,8 @@ def analyze(
     sensitivity: float = 0.3,
     n_bands_per_lane: int = 1,
     auto_crop: bool = True,
+    skip_first_lane: bool = False,
+    skip_last_lane: bool = False,
 ) -> tuple[np.ndarray, pd.DataFrame, tuple[int, int, int, int]]:
     """Full pipeline. Returns (annotated_full_image, results_df, gel_bbox).
 
@@ -218,6 +239,8 @@ def analyze(
         1 = strongest only (single-protein / dual-membrane mode)
         2 = top-2 bands (same-membrane target+reference mode)
         0 = keep all detected bands
+    skip_first_lane: drop the leftmost detected lane (usually the marker).
+    skip_last_lane:  drop the rightmost detected lane (marker on right side).
     auto_crop: detect and crop to the membrane region before analysis.
     """
     gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -231,6 +254,12 @@ def analyze(
 
     enhanced = preprocess(img_crop, radius)
     lanes = detect_lanes(enhanced, n_lanes=n_lanes, sensitivity=sensitivity)
+
+    # Drop marker lanes before processing
+    if skip_first_lane and len(lanes) > 1:
+        lanes = lanes[1:]
+    if skip_last_lane and len(lanes) > 1:
+        lanes = lanes[:-1]
 
     annotated = img_bgr.copy()
     rows = []

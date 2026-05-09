@@ -41,6 +41,13 @@ with st.sidebar:
             n_lanes = st.number_input("指定泳道数量", 1, 30, 6, 1)
         sensitivity = st.slider("检测灵敏度", 0.05, 0.80, 0.25, 0.05)
 
+        st.markdown("**排除 Marker 泳道**")
+        skip_first = st.checkbox("跳过最左侧泳道（左侧 marker）", value=False)
+        skip_last  = st.checkbox("跳过最右侧泳道（右侧 marker）", value=False)
+    else:
+        skip_first = False
+        skip_last  = False
+
     if mode == "单膜对比（目的蛋白+内参 同一张膜）" and not manual:
         st.divider()
         target_pos = st.radio("目的蛋白条带位置",
@@ -71,6 +78,8 @@ def run_auto(img_bgr, n_bands=1):
         sensitivity=sensitivity,
         n_bands_per_lane=n_bands,
         auto_crop=auto_crop,
+        skip_first_lane=skip_first,
+        skip_last_lane=skip_last,
     )
 
 def canvas_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
