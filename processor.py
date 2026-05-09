@@ -19,8 +19,15 @@ import pandas as pd
 # ════════════════════════ image-type detection ════════════════════════
 
 def detect_image_type(gray: np.ndarray) -> str:
-    """'light' = white/grey background with dark bands; 'dark' = black background."""
-    return "light" if float(np.median(gray)) > 127 else "dark"
+    """'light' = white/grey background with dark bands; 'dark' = black background.
+
+    Uses the 75th-percentile instead of the median so that ChemiDoc images
+    (grey membrane on a large black border) are still classified as 'light'
+    after the gel region has been cropped: p75 of a grey (~100) crop is
+    well above the 60-count cutoff, whereas pure-dark-bg fluorescence images
+    have p75 near zero.
+    """
+    return "light" if float(np.percentile(gray, 75)) > 60 else "dark"
 
 
 # ════════════════════════ preprocessing ══════════════════════════════
@@ -124,8 +131,8 @@ def _find_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
         if cv2.contourArea(cnt) < min_area:
             continue
         x, y, bw, bh = cv2.boundingRect(cnt)
-        ar = bw / (bh + 1e-6)
-        if ar > 25 or bh / (bw + 1e-6) > 15:   # reject extreme slivers
+        # Reject near-zero-height slivers and extreme vertical needles
+        if bh < 3 or bh / (bw + 1e-6) > 15:
             continue
         boxes.append((x, y, bw, bh))
 
@@ -199,6 +206,33 @@ def _lane_boundaries(
     half = max(4, int(spacing * (1.0 - gap_frac) / 2))
 
     return [(max(0, c - half), min(img_w, c + half)) for c in centers]
+
+
+def _uniform_lane_split(
+    boxes: list[tuple[int, int, int, int]],
+    n_lanes: int,
+    img_w: int,
+    gap_frac: float = 0.15,
+) -> list[tuple[int, int]]:
+    """Divide the detected signal x-region into n_lanes equal-width slots.
+
+    Used when detected groups < n_lanes (bands merge across lanes in the mask).
+    The x-extent comes from the union of all detected boxes.
+    """
+    if boxes:
+        x0 = min(b[0] for b in boxes)
+        x1 = max(b[0] + b[2] for b in boxes)
+    else:
+        x0, x1 = 0, img_w
+
+    sp   = (x1 - x0) / n_lanes
+    half = max(4, int(sp * (1.0 - gap_frac) / 2))
+
+    return [
+        (max(0, int(x0 + i * sp + sp / 2) - half),
+         min(img_w, int(x0 + i * sp + sp / 2) + half))
+        for i in range(n_lanes)
+    ]
 
 
 def _bands_from_boxes(
@@ -312,14 +346,18 @@ def analyze(
         groups = groups[:-1]
 
     # ── 6. Compute equal-width lane x-boundaries ──────────────────────
-    if groups:
+    if groups and (n_lanes is None or len(groups) >= n_lanes):
+        # Enough groups detected: use their centers for equal-width boundaries
         boundaries = _lane_boundaries(groups, cw)
+    elif n_lanes is not None:
+        # Fewer groups than requested (bands merged across lanes):
+        # divide the detected signal region evenly into n_lanes slots
+        boundaries = _uniform_lane_split(boxes, n_lanes, cw)
+        groups     = [[]] * n_lanes
     else:
-        # Fallback when no contours found: divide image evenly
-        n = n_lanes or 1
-        sp = cw // n
-        boundaries = [(i * sp, (i + 1) * sp) for i in range(n)]
-        groups     = [[]] * n
+        # Auto mode with no detections: single lane spanning the image
+        boundaries = [(0, cw)]
+        groups     = [[]]
 
     # ── 7. Per-lane: find bands, measure, annotate ────────────────────
     annotated = img_bgr.copy()
