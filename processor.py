@@ -322,17 +322,46 @@ def _band_y_boundaries(lane_enhanced: np.ndarray,
 
 # ════════════════════════ measurement ════════════════════════════════
 
+def _gaussian_col_weights(width: int) -> np.ndarray:
+    """1-D Gaussian weights for columns within a lane (centre-weighted).
+
+    Inspired by bioimage_quant: centre columns contribute more than edges,
+    reducing cross-contamination from signal bleed-through of adjacent lanes.
+    Uses ±3 σ range so the weights taper smoothly to ~0.01 at both edges.
+    """
+    x = np.linspace(-3.0, 3.0, width)
+    g = np.exp(-0.5 * x ** 2)
+    return g / g.sum()          # normalised so weights sum to 1
+
+
 def measure_roi(enhanced: np.ndarray, x0: int, x1: int,
                 y0: int, y1: int) -> dict:
-    """Area / Mean / Min / Max / IntDen / RawIntDen on the enhanced image."""
-    roi      = enhanced[y0:y1, x0:x1].astype(float)
-    area     = roi.size
-    mean_val = float(roi.mean()) if area > 0 else 0.0
+    """Area / Mean / Min / Max / IntDen / RawIntDen on the enhanced image.
+
+    Mean and IntDen are Gaussian column-weighted so the lane centre
+    contributes more than the edges.  RawIntDen is the plain pixel sum
+    (matches ImageJ's RawIntDen for cross-reference).
+    """
+    roi  = enhanced[y0:y1, x0:x1].astype(float)
+    area = roi.size
+    if area == 0:
+        return {"Area": 0, "Mean": 0.0, "Min": 0.0, "Max": 0.0,
+                "IntDen": 0.0, "RawIntDen": 0.0}
+
+    # Gaussian-weighted mean: per-column means → dot with Gaussian weights
+    w = roi.shape[1]
+    if w >= 3:
+        gauss    = _gaussian_col_weights(w)
+        col_mean = roi.mean(axis=0)           # shape (w,) — one mean per column
+        mean_val = float(np.dot(col_mean, gauss))
+    else:
+        mean_val = float(roi.mean())
+
     return {
         "Area":      int(area),
         "Mean":      round(mean_val, 3),
-        "Min":       round(float(roi.min()) if area > 0 else 0.0, 1),
-        "Max":       round(float(roi.max()) if area > 0 else 0.0, 1),
+        "Min":       round(float(roi.min()), 1),
+        "Max":       round(float(roi.max()), 1),
         "IntDen":    round(area * mean_val, 1),
         "RawIntDen": round(float(roi.sum()), 1),
     }
