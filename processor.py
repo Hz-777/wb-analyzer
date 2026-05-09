@@ -159,16 +159,26 @@ def _uniform_peaks(
     return np.array([x0 + spacing // 2 + i * spacing for i in range(n_lanes)])
 
 
-def _peaks_to_boundaries(peaks: np.ndarray, w: int) -> list[tuple[int, int]]:
-    """Convert lane-center x positions to (left, right) boundary pairs."""
-    boundaries = []
-    for i, pk in enumerate(peaks):
-        left  = (peaks[i - 1] + pk) // 2 if i > 0 \
-                else max(0, pk - (peaks[1] - peaks[0]) // 2 if len(peaks) > 1 else pk)
-        right = (pk + peaks[i + 1]) // 2 if i < len(peaks) - 1 \
-                else min(w, pk + (pk - peaks[i - 1]) // 2 if i > 0 else w)
-        boundaries.append((int(left), int(right)))
-    return boundaries
+def _peaks_to_boundaries(
+    peaks: np.ndarray, w: int, gap_frac: float = 0.15
+) -> list[tuple[int, int]]:
+    """Convert lane-center x positions to equal-width (left, right) pairs with gaps.
+
+    All boxes have the same width = spacing * (1 - gap_frac).
+    Gaps between adjacent boxes = spacing * gap_frac  (default 15 %).
+    This keeps Area identical across lanes, which is required for fair IntDen comparison.
+    """
+    n = len(peaks)
+    if n == 0:
+        return []
+    if n == 1:
+        half = w // 4
+        return [(max(0, peaks[0] - half), min(w, peaks[0] + half))]
+
+    spacing = int(np.median(np.diff(peaks)))
+    half = max(4, int(spacing * (1.0 - gap_frac) / 2))
+
+    return [(int(max(0, pk - half)), int(min(w, pk + half))) for pk in peaks]
 
 
 def detect_lanes(
