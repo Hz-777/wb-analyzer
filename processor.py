@@ -126,8 +126,12 @@ def analyze(
     radius: int = 50,
     n_lanes: int | None = None,
     sensitivity: float = 0.3,
+    strongest_only: bool = True,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    """Full pipeline: preprocess → detect lanes → detect bands → measure → return annotated image + DataFrame."""
+    """Full pipeline: preprocess → detect lanes → detect bands → measure → return annotated image + DataFrame.
+
+    strongest_only: if True, keep only the band with highest IntDen per lane (ignore non-specific bands).
+    """
     enhanced = preprocess(img_bgr, radius)
     lanes = detect_lanes(enhanced, n_lanes=n_lanes, sensitivity=sensitivity)
 
@@ -142,8 +146,17 @@ def analyze(
         if not bands:
             bands = [(0, enhanced.shape[0])]
 
-        for band_idx, (y0, y1) in enumerate(bands):
+        # Measure all candidate bands first
+        candidates = []
+        for y0, y1 in bands:
             metrics = measure_roi(enhanced, x0, x1, y0, y1)
+            candidates.append((y0, y1, metrics))
+
+        # Keep only the strongest band per lane if requested
+        if strongest_only and len(candidates) > 1:
+            candidates = [max(candidates, key=lambda c: c[2]["IntDen"])]
+
+        for band_idx, (y0, y1, metrics) in enumerate(candidates):
             rows.append({
                 "Lane": lane_idx + 1,
                 "Band": band_idx + 1,
@@ -153,13 +166,14 @@ def analyze(
                 "Y_end": y1,
                 **metrics,
             })
-            # Draw rectangle on annotated image
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 200, 80), 2)
+            # Draw rectangle: green for strongest-only mode, yellow for all-bands mode
+            color = (0, 200, 80) if strongest_only else (0, 220, 220)
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
             label = f"L{lane_idx + 1}"
             cv2.putText(
                 annotated, label,
                 (x0 + 4, y0 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 80), 2,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
             )
 
     df = pd.DataFrame(rows)

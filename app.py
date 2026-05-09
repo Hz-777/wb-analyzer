@@ -39,6 +39,12 @@ with st.sidebar:
         help="数值越低越容易检测到弱条带，但可能产生误报。",
     )
 
+    strongest_only = st.checkbox(
+        "每泳道只取最强条带",
+        value=True,
+        help="勾选后忽略非特异性弱带，仅对每条泳道中 IntDen 最大的条带进行定量（推荐）。",
+    )
+
     st.divider()
     st.markdown("**使用说明**")
     st.markdown(
@@ -72,6 +78,7 @@ with st.spinner("正在分析图片…"):
         radius=radius,
         n_lanes=None if auto_lanes else int(n_lanes),
         sensitivity=sensitivity,
+        strongest_only=strongest_only,
     )
     enhanced = preprocess(img_bgr, radius=radius)
 
