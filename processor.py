@@ -126,15 +126,25 @@ def _find_n_peaks(profile: np.ndarray, n: int, sensitivity: float) -> np.ndarray
 
 
 def _find_auto_peaks(profile: np.ndarray, sensitivity: float) -> np.ndarray:
-    """Auto-detect peaks (no target count) with a single stable pass."""
+    """Auto-detect peaks (no target count) with progressively relaxed thresholds.
+
+    Tries multiple height/prominence levels so that both strong and weak lane
+    profiles are handled.  Returns on the first pass that yields ≥ 2 peaks.
+    """
     if profile.max() == 0:
         return np.array([], dtype=int)
-    norm  = profile / profile.max()
-    size  = len(norm)
-    dist  = max(5, size // 20)
-    h_thr = sensitivity
-    pks, _ = find_peaks(norm, height=h_thr, distance=dist, prominence=h_thr * 0.3)
-    return pks
+    norm = profile / profile.max()
+    size = len(norm)
+    dist = max(5, size // 20)
+
+    for h_mult in [1.0, 0.7, 0.5, 0.35, 0.2, 0.12, 0.06]:
+        h_thr = sensitivity * h_mult
+        pks, _ = find_peaks(norm, height=h_thr, distance=dist,
+                            prominence=max(0.015, h_thr * 0.25))
+        if len(pks) >= 2:
+            return pks
+
+    return np.array([], dtype=int)
 
 
 def _peaks_to_equal_boundaries(peaks: np.ndarray, size: int,
@@ -307,12 +317,25 @@ def analyze(
     ch, cw   = enhanced.shape
 
     # ── 3. Lane x-detection via column projection ─────────────────────
-    # Sum only rows with significant signal (top-50 %) to sharpen valleys
-    row_sums  = enhanced.sum(axis=1).astype(float)
-    band_rows = row_sums >= np.percentile(row_sums[row_sums > 0], 50) \
-                if (row_sums > 0).any() else np.ones(ch, dtype=bool)
-    col_profile = _smooth(enhanced[band_rows].sum(axis=0).astype(float),
-                          max(3, cw // 60))
+    # Use the full column sum so that valleys between lanes are preserved even
+    # when bands span the whole gel height.  Sharpening via top-20 % rows is
+    # blended in for images where it helps (i.e. adds more peaks, not fewer).
+    col_raw = enhanced.sum(axis=0).astype(float)
+    col_profile = _smooth(col_raw, max(3, cw // 60))
+
+    # Also try the sharpened profile (only top-20 % brightest rows).
+    row_sums = enhanced.sum(axis=1).astype(float)
+    if (row_sums > 0).any():
+        pct80 = np.percentile(row_sums[row_sums > 0], 80)
+        bright_rows = row_sums >= pct80
+        if bright_rows.sum() >= 3:
+            col_sharp = _smooth(enhanced[bright_rows].sum(axis=0).astype(float),
+                                max(3, cw // 60))
+            # Prefer whichever profile has more peaks (= better lane separation)
+            auto_raw   = _find_auto_peaks(col_profile, sensitivity)
+            auto_sharp = _find_auto_peaks(col_sharp,   sensitivity)
+            if len(auto_sharp) > len(auto_raw):
+                col_profile = col_sharp
 
     if n_lanes is not None:
         lane_peaks = _find_n_peaks(col_profile, n_lanes, sensitivity)
