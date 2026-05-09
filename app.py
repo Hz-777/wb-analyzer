@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image as PILImage
 
+from streamlit_image_coordinates import streamlit_image_coordinates
 from processor import analyze, analyze_rois
 
 st.set_page_config(page_title="WB 条带自动定量", page_icon="🧬", layout="wide")
@@ -81,80 +82,99 @@ def run_auto(img_bgr, n_bands=1):
     return annotated, df, bbox, enhanced
 
 def manual_selector(img_bgr: np.ndarray, key: str, label: str = "") -> list[tuple[int,int,int,int]]:
-    """Uniform-box manual lane selection.
+    """Click-based manual lane selection.
 
-    User specifies the CENTER x of each lane + a single box width that applies
-    to every lane, guaranteeing all ROIs are exactly the same size so that
-    Area and IntDen values are directly comparable.
+    Step 1 — click the TOP-LEFT corner of the lane group (first lane, above the band).
+    Step 2 — click the BOTTOM-RIGHT corner (last lane, below the band).
+    The selected rectangle is automatically divided into n_lanes equal columns
+    with a 15 % gap between adjacent boxes, guaranteeing identical Area for
+    every lane so IntDen values are directly comparable.
     """
     h, w = img_bgr.shape[:2]
     if label:
         st.markdown(f"**{label}**")
 
-    # ── Coordinate ruler overlay ───────────────────────────────────────────
-    guide = img_bgr.copy()
-    tick_step = max(20, round(w / 30 / 10) * 10)
-    for x in range(0, w + 1, tick_step):
-        is_major = (x % (tick_step * 5) == 0)
-        cv2.line(guide, (x, 0), (x, 18 if is_major else 10), (30, 30, 200), 1)
-        if is_major:
-            cv2.putText(guide, str(x), (max(0, x - 12), 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (30, 30, 200), 1)
-    cv2.line(guide, (0, 1), (w, 1), (30, 30, 200), 1)
-    st.image(cv2.cvtColor(guide, cv2.COLOR_BGR2RGB), use_container_width=True)
-    st.caption(f"📐 图片尺寸：{w} × {h} px  ｜  蓝色刻度为 x 坐标（每 {tick_step} px 一格）")
+    # ── Session state: store up to 2 click points per key ─────────────────
+    ck = f"{key}_pts"
+    if ck not in st.session_state:
+        st.session_state[ck] = []
+    pts: list[dict] = st.session_state[ck]
 
-    # ── Controls ───────────────────────────────────────────────────────────
-    c1, c2 = st.columns([3, 2])
-    with c1:
+    # ── Controls row ──────────────────────────────────────────────────────
+    col_n, col_gap, col_btn = st.columns([2, 2, 1])
+    with col_n:
         n = st.number_input("泳道数量", 1, 30, 6, 1, key=f"{key}_n")
-        default_centers = ", ".join(
-            str(round(w * (2 * i + 1) / (2 * n))) for i in range(n)
-        )
-        centers_input = st.text_input(
-            f"每条泳道中心 x 坐标（{n} 个值，逗号分隔）",
-            value=default_centers,
-            key=f"{key}_cx",
-            help="从刻度尺读取每条泳道正中心的 x 像素值，填 n 个数字。",
-        )
-    with c2:
-        default_bw = max(10, round(w / n * 0.7 / 5) * 5)
-        box_w = st.number_input(
-            "统一框宽（像素）", 5, w, default_bw, 5, key=f"{key}_bw",
-            help="所有泳道使用相同的框宽，保证 Area 一致、IntDen 可比。",
-        )
-        y0 = st.number_input("条带上边界 y", 0, h - 1, h // 4, key=f"{key}_y0")
-        y1 = st.number_input("条带下边界 y", 1, h,     h * 3 // 4, key=f"{key}_y1")
+    with col_gap:
+        gap_pct = st.slider("泳道间隙 %", 0, 30, 15, 1, key=f"{key}_gap",
+                            help="相邻泳道框之间的间隔，保证 Area 一致时不需要改动")
+    with col_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 重选", key=f"{key}_reset"):
+            st.session_state[ck] = []
+            st.rerun()
 
-    # ── Parse centers ──────────────────────────────────────────────────────
-    rois: list[tuple[int,int,int,int]] = []
-    try:
-        centers = [int(v.strip()) for v in centers_input.split(",") if v.strip()]
-    except ValueError:
-        st.error("格式有误，请输入整数，以英文逗号分隔。")
-        centers = []
-
-    if centers:
-        if len(centers) != n:
-            st.warning(f"需要 {n} 个中心坐标，当前填写了 {len(centers)} 个。")
-        else:
-            half = box_w // 2
-            iy0, iy1 = int(y0), int(y1)
-            rois = [(max(0, cx - half), iy0, min(w, cx + half), iy1)
-                    for cx in centers]
-
-    # ── Live preview ───────────────────────────────────────────────────────
-    if rois:
-        box_h = int(y1) - int(y0)
-        preview = img_bgr.copy()
-        for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
-            cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), (0, 200, 80), 2)
-            cv2.putText(preview, f"L{i + 1}", (rx0 + 4, ry0 + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 80), 2)
-        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
-        st.success(f"✅ 所有框尺寸一致：宽 {box_w} × 高 {box_h} px  ｜  共 {n} 条泳道")
+    # ── Step indicator ────────────────────────────────────────────────────
+    if len(pts) == 0:
+        st.info("① 点击**第一条泳道左上角**")
+    elif len(pts) == 1:
+        st.info("② 点击**最后一条泳道右下角**")
     else:
-        st.info("填写完整的中心坐标后，预览将显示在此处。")
+        st.success("✅ 区域已选定，可调整泳道数量后直接分析 · 点『🔄 重选』重新框选")
+
+    # ── Build overlay image showing markers + preview boxes ───────────────
+    overlay = img_bgr.copy()
+    marker_colors = [(0, 200, 255), (255, 120, 0)]   # cyan, orange
+    for i, pt in enumerate(pts):
+        cx, cy = pt["x"], pt["y"]
+        cv2.drawMarker(overlay, (cx, cy), marker_colors[i],
+                       cv2.MARKER_CROSS, 24, 3)
+        cv2.circle(overlay, (cx, cy), 10, marker_colors[i], 2)
+        cv2.putText(overlay, ["①", "②"][i], (cx + 12, cy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, marker_colors[i], 2)
+
+    rois: list[tuple[int,int,int,int]] = []
+
+    if len(pts) >= 2:
+        x0 = min(pts[0]["x"], pts[1]["x"])
+        y0 = min(pts[0]["y"], pts[1]["y"])
+        x1 = max(pts[0]["x"], pts[1]["x"])
+        y1 = max(pts[0]["y"], pts[1]["y"])
+
+        # Divide [x0, x1] into n equal columns with gap
+        total = x1 - x0
+        sp    = total / n
+        half  = max(2, int(sp * (1 - gap_pct / 100) / 2))
+        for i in range(n):
+            cx   = int(x0 + i * sp + sp / 2)
+            rx0  = max(0, cx - half)
+            rx1  = min(w, cx + half)
+            rois.append((rx0, y0, rx1, y1))
+
+        # Draw the boxes on overlay
+        for i, (rx0, ry0, rx1, ry1) in enumerate(rois):
+            cv2.rectangle(overlay, (rx0, ry0), (rx1, ry1), (0, 220, 80), 2)
+            cv2.putText(overlay, f"L{i + 1}", (rx0 + 3, ry0 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 80), 2)
+        box_w = rois[0][2] - rois[0][0] if rois else 0
+        box_h = y1 - y0
+        st.caption(f"每框尺寸：{box_w} × {box_h} px  |  共 {n} 条泳道  |  间隙 {gap_pct}%")
+
+    # ── Clickable image (coordinates in original pixel space) ─────────────
+    img_pil = PILImage.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    clicked = streamlit_image_coordinates(img_pil, key=f"{key}_canvas",
+                                          use_column_width=True)
+
+    if clicked is not None:
+        # Accept click only if we still need points (max 2)
+        if len(pts) < 2:
+            # Scale from display coordinates → original image coordinates
+            # streamlit_image_coordinates returns coords in the display size;
+            # we need to map back to the original image pixel space.
+            # The image is shown at use_column_width=True; the library does
+            # this mapping automatically and returns original-space coords.
+            pts.append(clicked)
+            st.session_state[ck] = pts
+            st.rerun()
 
     return rois
 
