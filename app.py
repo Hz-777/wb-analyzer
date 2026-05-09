@@ -41,41 +41,100 @@ def load_image(uploaded) -> np.ndarray | None:
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
+def _add_ruler(img_bgr: np.ndarray, pad: int = 36) -> np.ndarray:
+    """Draw pixel-coordinate rulers on top and left of the image."""
+    h, w = img_bgr.shape[:2]
+    canvas = np.full((h + pad, w + pad, 3), 30, dtype=np.uint8)   # dark background
+    canvas[pad:, pad:] = img_bgr
+
+    # Adaptive tick spacing
+    for dim, length in [(w, "x"), (h, "y")]:
+        if dim <= 500:
+            major, minor = 50, 10
+        elif dim <= 1500:
+            major, minor = 100, 50
+        elif dim <= 3000:
+            major, minor = 200, 100
+        else:
+            major, minor = 500, 100
+
+        ticks = range(0, dim, minor)
+        for t in ticks:
+            is_major = (t % major == 0)
+            tk_len = 8 if is_major else 4
+            if length == "x":
+                x = t + pad
+                cv2.line(canvas, (x, pad - tk_len), (x, pad), (180, 180, 180), 1)
+                if is_major and t > 0:
+                    cv2.putText(canvas, str(t), (x - 14, pad - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+            else:
+                y = t + pad
+                cv2.line(canvas, (pad - tk_len, y), (pad, y), (180, 180, 180), 1)
+                if is_major and t > 0:
+                    cv2.putText(canvas, str(t), (0, y + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+
+    # Corner label
+    cv2.putText(canvas, "px", (2, pad - 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (120, 120, 120), 1)
+    return canvas
+
+
+def _synced(label: str, lo: int, hi: int, default: int, key: str) -> int:
+    """Slider + number_input kept in sync via a shared session-state value."""
+    ck = f"{key}_v"
+    if ck not in st.session_state:
+        st.session_state[ck] = max(lo, min(hi, default))
+
+    cur = st.session_state[ck]
+    col_s, col_n = st.columns([3, 1])
+    with col_s:
+        sv = st.slider(label, lo, hi, value=cur, key=f"{key}_s")
+    with col_n:
+        nv = st.number_input("px", lo, hi, value=cur, step=1,
+                             key=f"{key}_n", label_visibility="collapsed")
+
+    # Whichever changed takes priority
+    new = sv if sv != cur else (nv if nv != cur else cur)
+    st.session_state[ck] = new
+    return new
+
+
 def slider_roi(img_bgr: np.ndarray, key: str, label: str = "",
                color: tuple = (0, 220, 80)) -> list[tuple[int, int, int, int]]:
-    """Slider-based ROI selector.
+    """Slider + number-input ROI selector with pixel ruler overlay.
 
-    User drags 4 sliders to define a bounding rectangle covering all lanes,
-    sets the number of lanes, and the box is split into equal columns.
-    Returns list of (x0, y0, x1, y1) per lane, sorted left-to-right.
+    Four boundaries (left / right / top / bottom) each have a draggable slider
+    AND a direct number input — both stay in sync.  The image is shown with a
+    pixel-coordinate ruler so the user can read off exact positions.
     """
     h, w = img_bgr.shape[:2]
 
     if label:
         st.markdown(f"**{label}**")
 
-    # ── Sliders ────────────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
+    # ── Four boundaries: slider + number_input ─────────────────────────────
+    c1, c2 = st.columns(2)
     with c1:
-        x0 = st.slider("左边界", 0, w - 1, 0,           key=f"{key}_x0")
+        x0 = _synced("← 左边界", 0, w - 1, 0,          f"{key}_x0")
+        x1 = _synced("→ 右边界", 0, w - 1, w - 1,      f"{key}_x1")
     with c2:
-        x1 = st.slider("右边界", 0, w - 1, w - 1,       key=f"{key}_x1")
-    with c3:
-        y0 = st.slider("上边界", 0, h - 1, h // 4,      key=f"{key}_y0")
-    with c4:
-        y1 = st.slider("下边界", 0, h - 1, h * 3 // 4,  key=f"{key}_y1")
+        y0 = _synced("↑ 上边界", 0, h - 1, h // 4,     f"{key}_y0")
+        y1 = _synced("↓ 下边界", 0, h - 1, h * 3 // 4, f"{key}_y1")
 
-    c5, c6 = st.columns(2)
-    with c5:
+    c3, c4 = st.columns(2)
+    with c3:
         n = st.number_input("泳道数量", 1, 30, 6, 1, key=f"{key}_n")
-    with c6:
+    with c4:
         gap_pct = st.slider("泳道间隙 %", 0, 30, 10, 1, key=f"{key}_gap")
 
-    # Normalise: ensure x0 < x1, y0 < y1
     lx, rx = (x0, x1) if x0 < x1 else (x1, x0)
     ty, by = (y0, y1) if y0 < y1 else (y1, y0)
     if rx - lx < 4 or by - ty < 4:
-        st.warning("请调整滑块，使左边界 < 右边界，且上边界 < 下边界")
+        st.warning("左边界需小于右边界，且上边界需小于下边界")
+        ruler = _add_ruler(img_bgr)
+        st.image(cv2.cvtColor(ruler, cv2.COLOR_BGR2RGB), use_container_width=True)
         return []
 
     # ── Build lane boxes ───────────────────────────────────────────────────
@@ -89,8 +148,10 @@ def slider_roi(img_bgr: np.ndarray, key: str, label: str = "",
         bx1 = min(w, cx + half)
         rois.append((bx0, ty, bx1, by))
 
-    # ── Overlay preview ────────────────────────────────────────────────────
+    # ── Overlay on image ───────────────────────────────────────────────────
     overlay = img_bgr.copy()
+    # Outer boundary guide lines (dim color)
+    cv2.rectangle(overlay, (lx, ty), (rx, by), (80, 80, 80), 1)
     for i, (bx0, by0, bx1, by1) in enumerate(rois):
         cv2.rectangle(overlay, (bx0, by0), (bx1, by1), color, 2)
         cv2.putText(overlay, f"L{i + 1}", (bx0 + 4, by0 + 20),
@@ -98,8 +159,14 @@ def slider_roi(img_bgr: np.ndarray, key: str, label: str = "",
 
     box_w = rois[0][2] - rois[0][0] if rois else 0
     box_h = by - ty
-    st.caption(f"每框 {box_w} × {box_h} px  ·  共 {int(n)} 条泳道  ·  间隙 {gap_pct}%")
-    st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), use_container_width=True)
+    st.caption(
+        f"区域：x {lx}–{rx}  ·  y {ty}–{by}  ·  "
+        f"每框 {box_w}×{box_h} px  ·  {int(n)} 条泳道"
+    )
+
+    # Add pixel ruler and display
+    ruler_img = _add_ruler(overlay)
+    st.image(cv2.cvtColor(ruler_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     return rois
 
