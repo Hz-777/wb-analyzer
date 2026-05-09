@@ -1,30 +1,14 @@
 import base64
-import os
 
 import cv2
 import numpy as np
 import streamlit.components.v1 as components
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
-_LOCAL_FRONTEND = os.path.join(_DIR, "frontend")
-
-# On Streamlit Cloud the local path won't serve; use GitHub Pages instead.
-_IS_CLOUD = (
-    not os.path.isdir(_LOCAL_FRONTEND)
-    or os.environ.get("STREAMLIT_SHARING_MODE") is not None
-    or os.environ.get("IS_STREAMLIT_CLOUD") is not None
+# Always load frontend from GitHub Pages — works on both local and Cloud.
+_component_func = components.declare_component(
+    "wb_roi_canvas",
+    url="https://hz-777.github.io/wb-analyzer/",
 )
-
-if _IS_CLOUD:
-    _component_func = components.declare_component(
-        "wb_roi_canvas",
-        url="https://hz-777.github.io/wb-analyzer/",
-    )
-else:
-    _component_func = components.declare_component(
-        "wb_roi_canvas",
-        path=_LOCAL_FRONTEND,
-    )
 
 
 def wb_roi_canvas(
@@ -35,15 +19,14 @@ def wb_roi_canvas(
     """Drag-to-draw ROI selector on a WB image.
 
     Renders an HTML5 canvas inside a Streamlit component iframe.
-    Coordinate mapping is done inside JavaScript where canvas dimensions
-    are exact — no Python-side scaling guesswork.
+    Coordinate mapping is done entirely in JavaScript — no Python-side
+    scaling guesswork.
 
     Returns list of (x0, y0, x1, y1) in original image pixel coordinates,
     sorted left-to-right.
     """
     h, w = img_bgr.shape[:2]
 
-    # Send a display-sized JPEG to keep payload small
     dh = max(1, int(h * display_width / w))
     disp = cv2.resize(img_bgr, (display_width, dh), interpolation=cv2.INTER_AREA)
     _, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 88])
