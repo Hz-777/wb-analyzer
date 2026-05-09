@@ -148,16 +148,11 @@ def _find_auto_peaks(profile: np.ndarray, sensitivity: float) -> np.ndarray:
 
 
 def _merge_doublet_peaks(peaks: np.ndarray) -> np.ndarray:
-    """Merge pairs of peaks that are anomalously close together.
-
-    When the column profile has a shoulder on one lane, two sub-peaks appear
-    very close.  Treat any adjacent pair whose spacing is < half the median
-    spacing as a single lane (replace with their midpoint).
-    """
+    """Merge adjacent peak pairs that are anomalously close (< 55 % of median spacing)."""
     if len(peaks) < 3:
         return peaks
-    diffs = np.diff(peaks.astype(float))
-    med   = float(np.median(diffs))
+    diffs  = np.diff(peaks.astype(float))
+    med    = float(np.median(diffs))
     merged: list[int] = []
     i = 0
     while i < len(peaks):
@@ -168,6 +163,68 @@ def _merge_doublet_peaks(peaks: np.ndarray) -> np.ndarray:
             merged.append(int(peaks[i]))
             i += 1
     return np.array(merged, dtype=int)
+
+
+def _lane_regions_from_profile(
+    col_profile: np.ndarray,
+    gap_frac: float = 0.15,
+) -> list[tuple[int, int]]:
+    """Segment lanes from the column projection using connected-region analysis.
+
+    Each lane is a vertical rectangle, so its columns form a connected block
+    of high signal separated from adjacent lanes by near-zero gutter columns.
+    Otsu's method finds the lane/gutter threshold automatically; morphological
+    closing fills narrow within-lane dips before segmentation.
+
+    Returns a list of (x_left, x_right) lane boundaries (with gap applied).
+    """
+    size = len(col_profile)
+    if size == 0 or col_profile.max() == 0:
+        return [(0, size - 1)]
+
+    norm = col_profile / col_profile.max()
+
+    # Otsu threshold: separates lane-signal columns from gutter columns
+    u8  = (norm * 255).astype(np.uint8)
+    otsu_val, _ = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = np.clip(float(otsu_val) / 255.0, 0.08, 0.60)
+
+    binary = (norm >= thr).astype(np.uint8)
+
+    # Morphological close: fills within-lane gaps narrower than ~lane_width/5
+    close_w = max(3, size // 60)
+    binary  = cv2.morphologyEx(
+        binary.reshape(1, -1),
+        cv2.MORPH_CLOSE,
+        np.ones((1, close_w), np.uint8),
+    ).reshape(-1)
+
+    # Extract connected runs; discard tiny noise regions
+    min_w   = max(5, size // 40)
+    regions: list[tuple[int, int]] = []
+    i = 0
+    while i < size:
+        if binary[i]:
+            j = i
+            while j < size and binary[j]:
+                j += 1
+            if j - i >= min_w:
+                regions.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    if not regions:
+        return []
+
+    # Convert each connected region → equal-width lane box with gap
+    bounds = []
+    for x0, x1 in regions:
+        cx   = (x0 + x1) // 2
+        half = max(3, int((x1 - x0 + 1) * (1.0 - gap_frac) / 2))
+        bounds.append((max(0, cx - half), min(size - 1, cx + half)))
+
+    return bounds
 
 
 def _peaks_to_equal_boundaries(peaks: np.ndarray, size: int,
@@ -375,10 +432,14 @@ def analyze(
             x1_sig   = int(sig_cols[-1]) if len(sig_cols) else cw
             lane_bounds = _uniform_split(x0_sig, x1_sig, n_lanes, img_w=cw)
     else:
-        lane_peaks = _find_auto_peaks(col_profile, sensitivity)
-        lane_peaks = _merge_doublet_peaks(lane_peaks)
-        lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw) \
-                      if len(lane_peaks) else [(0, cw)]
+        # Primary: connected-region analysis (exploits the rectangular lane shape)
+        lane_bounds = _lane_regions_from_profile(col_profile)
+        if len(lane_bounds) < 2:
+            # Fallback: peak-based with doublet merging
+            lane_peaks  = _find_auto_peaks(col_profile, sensitivity)
+            lane_peaks  = _merge_doublet_peaks(lane_peaks)
+            lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw) \
+                          if len(lane_peaks) >= 2 else [(0, cw)]
 
     # ── 4. Skip marker lanes ──────────────────────────────────────────
     if skip_first_lane and len(lane_bounds) > 1:
