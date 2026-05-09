@@ -147,6 +147,29 @@ def _find_auto_peaks(profile: np.ndarray, sensitivity: float) -> np.ndarray:
     return np.array([], dtype=int)
 
 
+def _merge_doublet_peaks(peaks: np.ndarray) -> np.ndarray:
+    """Merge pairs of peaks that are anomalously close together.
+
+    When the column profile has a shoulder on one lane, two sub-peaks appear
+    very close.  Treat any adjacent pair whose spacing is < half the median
+    spacing as a single lane (replace with their midpoint).
+    """
+    if len(peaks) < 3:
+        return peaks
+    diffs = np.diff(peaks.astype(float))
+    med   = float(np.median(diffs))
+    merged: list[int] = []
+    i = 0
+    while i < len(peaks):
+        if i + 1 < len(peaks) and diffs[i] < med * 0.55:
+            merged.append(int((peaks[i] + peaks[i + 1]) // 2))
+            i += 2
+        else:
+            merged.append(int(peaks[i]))
+            i += 1
+    return np.array(merged, dtype=int)
+
+
 def _peaks_to_equal_boundaries(peaks: np.ndarray, size: int,
                                 gap_frac: float = 0.15) -> list[tuple[int, int]]:
     """Convert peak x-positions → equal-width (left, right) with gap_frac gap."""
@@ -214,7 +237,9 @@ def _band_y_boundaries(lane_enhanced: np.ndarray,
     bands = []
     for pk in peaks:
         pk_val   = norm[pk]
-        edge_thr = max(sensitivity * 0.15, pk_val * 0.30)
+        # Stop when signal drops below 20 % of peak (wider than the old 30 %)
+        # OR when it starts rising again (entering the next band).
+        edge_thr = max(sensitivity * 0.10, pk_val * 0.20)
 
         y0 = int(pk)
         while y0 > 0 and norm[y0 - 1] >= edge_thr and norm[y0 - 1] <= norm[y0]:
@@ -224,8 +249,10 @@ def _band_y_boundaries(lane_enhanced: np.ndarray,
         while y1 < h - 1 and norm[y1 + 1] >= edge_thr and norm[y1 + 1] <= norm[y1]:
             y1 += 1
 
-        y0 = max(0,     y0 - 1)
-        y1 = min(h - 1, y1 + 1)
+        # Extra margin: ≥3 px or 25 % of the detected half-width, whichever larger
+        pad = max(3, (y1 - y0) // 4)
+        y0  = max(0,     y0 - pad)
+        y1  = min(h - 1, y1 + pad)
         bands.append((y0, y1 + 1))
 
     # Keep top-n by integrated signal (when forced)
@@ -348,7 +375,8 @@ def analyze(
             x1_sig   = int(sig_cols[-1]) if len(sig_cols) else cw
             lane_bounds = _uniform_split(x0_sig, x1_sig, n_lanes, img_w=cw)
     else:
-        lane_peaks  = _find_auto_peaks(col_profile, sensitivity)
+        lane_peaks = _find_auto_peaks(col_profile, sensitivity)
+        lane_peaks = _merge_doublet_peaks(lane_peaks)
         lane_bounds = _peaks_to_equal_boundaries(lane_peaks, cw) \
                       if len(lane_peaks) else [(0, cw)]
 
