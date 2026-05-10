@@ -39,31 +39,44 @@ def load_image(uploaded) -> np.ndarray | None:
 
 def box_selector(img_bgr: np.ndarray, key: str,
                  label: str = "", color: str = "#00dc50"):
-    """Drag-to-draw ROI selector using Plotly go.Image + st.plotly_chart on_select."""
+    """Drag-to-draw ROI selector with zoom/pan mode for precision."""
     ck_boxes = f"{key}_boxes"
     ck_last  = f"{key}_last_sel"
-    for k, d in [(ck_boxes, []), (ck_last, None)]:
+    ck_mode  = f"{key}_mode"
+    for k, d in [(ck_boxes, []), (ck_last, None), (ck_mode, "select")]:
         if k not in st.session_state:
             st.session_state[k] = d
 
-    boxes = st.session_state[ck_boxes]
-    h, w  = img_bgr.shape[:2]
+    boxes    = st.session_state[ck_boxes]
+    cur_mode = st.session_state[ck_mode]
+    h, w     = img_bgr.shape[:2]
 
     if label:
         st.markdown(f"**{label}**")
 
-    col_info, col_btn = st.columns([5, 1])
-    with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([3, 3, 1])
+    with c1:
+        if st.button("🔍 放大/平移", key=f"{key}_pan_btn",
+                     type="primary" if cur_mode == "pan" else "secondary"):
+            st.session_state[ck_mode] = "pan"
+            st.rerun()
+    with c2:
+        if st.button("⬜ 框选条带", key=f"{key}_sel_btn",
+                     type="primary" if cur_mode == "select" else "secondary"):
+            st.session_state[ck_mode] = "select"
+            st.rerun()
+    with c3:
         if st.button("🗑 清空", key=f"{key}_clr"):
             st.session_state[ck_boxes] = []
             st.session_state[ck_last]  = None
             st.rerun()
-    with col_info:
-        if boxes:
-            st.success(f"✅ 已画 {len(boxes)} 个框，可继续拖动添加")
-        else:
-            st.info("在图片上**拖动鼠标**框选条带区域")
+
+    if cur_mode == "pan":
+        st.info("🔍 拖动平移 · 滚轮缩放，精准定位后点「⬜ 框选条带」")
+    elif boxes:
+        st.success(f"✅ 已画 {len(boxes)} 个框，继续拖动可添加")
+    else:
+        st.info("⬜ 在图片上拖动鼠标框选条带区域")
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     fig = go.Figure()
@@ -71,22 +84,20 @@ def box_selector(img_bgr: np.ndarray, key: str,
 
     fs = max(11, int(max(1.0, w / 800) * 13))
     for i, (x0, y0, x1, y1) in enumerate(boxes):
-        fig.add_shape(type="rect",
-                      x0=x0 - 0.5, y0=y0 - 0.5, x1=x1 + 0.5, y1=y1 + 0.5,
+        # No ±0.5 offset — draw at exact pixel coordinates
+        fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
                       line=dict(color=color, width=2))
-        fig.add_annotation(x=x0 + 5, y=y0 + 18, text=f"<b>L{i+1}</b>",
+        fig.add_annotation(x=x0 + 4, y=y0 + fs, text=f"<b>L{i+1}</b>",
                            showarrow=False, xanchor="left",
                            font=dict(color=color, size=fs))
 
     disp_h = min(650, max(300, int(700 * h / w)))
     fig.update_layout(
-        dragmode="select",
+        dragmode=cur_mode,
         margin=dict(l=0, r=0, t=0, b=0),
         height=disp_h,
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
-                   range=[-0.5, w - 0.5]),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
-                   range=[h - 0.5, -0.5]),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         newselection=dict(line=dict(color=color, width=2, dash="dash")),
     )
 
@@ -98,14 +109,14 @@ def box_selector(img_bgr: np.ndarray, key: str,
         selection_mode=["box"],
     )
 
-    if event and event.selection:
+    if cur_mode == "select" and event and event.selection:
         sel_boxes = event.selection.get("box", [])
         if sel_boxes:
             sig = str(sel_boxes[0])
             if sig != st.session_state[ck_last]:
-                box = sel_boxes[0]
-                xs  = box.get("x", [])
-                ys  = box.get("y", [])
+                b  = sel_boxes[0]
+                xs = b.get("x", [])
+                ys = b.get("y", [])
                 if len(xs) >= 2 and len(ys) >= 2:
                     x0 = max(0, min(w - 1, int(round(min(xs)))))
                     x1 = max(0, min(w - 1, int(round(max(xs)))))
@@ -116,7 +127,31 @@ def box_selector(img_bgr: np.ndarray, key: str,
                 st.session_state[ck_last] = sig
                 st.rerun()
 
-    return sorted(boxes, key=lambda r: r[0])
+    # Fine-tune panel: edit coordinates numerically after drawing
+    if boxes:
+        with st.expander(f"🎯 精确调整坐标（{len(boxes)} 个框）"):
+            with st.form(key=f"{key}_tune_form"):
+                hdr = st.columns([1, 2, 2, 2, 2])
+                for txt, col in zip(["泳道", "x 起", "y 起", "x 止", "y 止"], hdr):
+                    col.markdown(f"**{txt}**")
+                new_vals = []
+                for i, (x0, y0, x1, y1) in enumerate(boxes):
+                    row = st.columns([1, 2, 2, 2, 2])
+                    row[0].markdown(f"L{i+1}")
+                    nx0 = row[1].number_input("", 0, w-1, int(x0), step=1,
+                                               key=f"{key}_fx0_{i}", label_visibility="collapsed")
+                    ny0 = row[2].number_input("", 0, h-1, int(y0), step=1,
+                                               key=f"{key}_fy0_{i}", label_visibility="collapsed")
+                    nx1 = row[3].number_input("", 0, w-1, int(x1), step=1,
+                                               key=f"{key}_fx1_{i}", label_visibility="collapsed")
+                    ny1 = row[4].number_input("", 0, h-1, int(y1), step=1,
+                                               key=f"{key}_fy1_{i}", label_visibility="collapsed")
+                    new_vals.append((int(nx0), int(ny0), int(nx1), int(ny1)))
+                if st.form_submit_button("✅ 应用调整"):
+                    st.session_state[ck_boxes] = new_vals
+                    st.rerun()
+
+    return sorted(st.session_state[ck_boxes], key=lambda r: r[0])
 
 
 def show_annotated(img_bgr, roi_groups):
