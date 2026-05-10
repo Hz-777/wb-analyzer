@@ -2,9 +2,8 @@ import io
 import cv2
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image as PILImage
-from streamlit_image_coordinates import streamlit_image_coordinates
 
 from processor import analyze_rois
 
@@ -24,9 +23,8 @@ with st.sidebar:
     st.divider()
     st.markdown(
         "**画框说明**\n\n"
-        "① 点击条带**左上角**\n\n"
-        "② 点击条带**右下角** → 框生成\n\n"
-        "重复以上步骤画多个框\n\n"
+        "在图片上**拖动鼠标**框选条带\n\n"
+        "每拖一次 = 添加一个框\n\n"
         "点「🗑 清空」重新开始"
     )
 
@@ -40,22 +38,16 @@ def load_image(uploaded) -> np.ndarray | None:
 
 
 def box_selector(img_bgr: np.ndarray, key: str,
-                 label: str = "", color: tuple = (0, 220, 80)):
-    """Two-click-per-box ROI selector using streamlit_image_coordinates.
-
-    streamlit_image_coordinates with use_column_width=True returns coordinates
-    in the ORIGINAL image pixel space (the library scales internally via
-    img.naturalWidth / img.offsetWidth).  No manual scaling is applied.
-    """
+                 label: str = "", color: str = "#00dc50"):
+    """Drag-to-draw ROI selector using Plotly go.Image + st.plotly_chart on_select."""
     ck_boxes = f"{key}_boxes"
-    ck_pt1   = f"{key}_pt1"
-    ck_prev  = f"{key}_prev"
-    for k, d in [(ck_boxes, []), (ck_pt1, None), (ck_prev, None)]:
+    ck_last  = f"{key}_last_sel"
+    for k, d in [(ck_boxes, []), (ck_last, None)]:
         if k not in st.session_state:
             st.session_state[k] = d
 
     boxes = st.session_state[ck_boxes]
-    pt1   = st.session_state[ck_pt1]
+    h, w  = img_bgr.shape[:2]
 
     if label:
         st.markdown(f"**{label}**")
@@ -65,51 +57,64 @@ def box_selector(img_bgr: np.ndarray, key: str,
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑 清空", key=f"{key}_clr"):
             st.session_state[ck_boxes] = []
-            st.session_state[ck_pt1]   = None
-            st.session_state[ck_prev]  = None
+            st.session_state[ck_last]  = None
             st.rerun()
     with col_info:
-        if pt1 is None:
-            if boxes:
-                st.success(f"✅ 已画 {len(boxes)} 个框，继续点左上角加框")
-            else:
-                st.info("① 点击条带**左上角**")
+        if boxes:
+            st.success(f"✅ 已画 {len(boxes)} 个框，可继续拖动添加")
         else:
-            st.warning("② 点击条带**右下角**（左上角已记录 ✓）")
+            st.info("在图片上**拖动鼠标**框选条带区域")
 
-    # Draw overlay on the original-size image
-    h, w = img_bgr.shape[:2]
-    s = max(1.0, w / 800)                      # scale drawing elements
-    lw = max(2, int(s * 2))
-    fs = max(0.5, s * 0.55)
-    overlay = img_bgr.copy()
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    fig = go.Figure()
+    fig.add_trace(go.Image(z=img_rgb))
+
+    fs = max(11, int(max(1.0, w / 800) * 13))
     for i, (x0, y0, x1, y1) in enumerate(boxes):
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), color, lw)
-        cv2.putText(overlay, f"L{i+1}", (x0 + int(4*s), y0 + int(22*s)),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, color, max(1, lw-1))
-    if pt1 is not None:
-        ms = max(24, int(s * 28))
-        cv2.drawMarker(overlay, pt1, (0, 200, 255), cv2.MARKER_CROSS, ms, lw)
+        fig.add_shape(type="rect",
+                      x0=x0 - 0.5, y0=y0 - 0.5, x1=x1 + 0.5, y1=y1 + 0.5,
+                      line=dict(color=color, width=2))
+        fig.add_annotation(x=x0 + 5, y=y0 + 18, text=f"<b>L{i+1}</b>",
+                           showarrow=False, xanchor="left",
+                           font=dict(color=color, size=fs))
 
-    # Pass ORIGINAL image — library maps click back to original pixel coords
-    img_pil = PILImage.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-    clicked = streamlit_image_coordinates(img_pil, key=f"{key}_canvas",
-                                          use_column_width=True)
+    disp_h = min(650, max(300, int(700 * h / w)))
+    fig.update_layout(
+        dragmode="select",
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=disp_h,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                   range=[-0.5, w - 0.5]),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                   range=[h - 0.5, -0.5]),
+        newselection=dict(line=dict(color=color, width=2, dash="dash")),
+    )
 
-    if clicked and clicked != st.session_state[ck_prev]:
-        cx = max(0, min(w - 1, int(clicked["x"])))
-        cy = max(0, min(h - 1, int(clicked["y"])))
-        if pt1 is None:
-            st.session_state[ck_pt1]  = (cx, cy)
-            st.session_state[ck_prev] = clicked
-        else:
-            x0, x1 = sorted([pt1[0], cx])
-            y0, y1 = sorted([pt1[1], cy])
-            if x1 - x0 > 4 and y1 - y0 > 4:
-                st.session_state[ck_boxes].append((x0, y0, x1, y1))
-            st.session_state[ck_pt1]  = None
-            st.session_state[ck_prev] = clicked
-        st.rerun()
+    event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"{key}_chart",
+        on_select="rerun",
+        selection_mode=["box"],
+    )
+
+    if event and event.selection:
+        sel_boxes = event.selection.get("box", [])
+        if sel_boxes:
+            sig = str(sel_boxes[0])
+            if sig != st.session_state[ck_last]:
+                box = sel_boxes[0]
+                xs  = box.get("x", [])
+                ys  = box.get("y", [])
+                if len(xs) >= 2 and len(ys) >= 2:
+                    x0 = max(0, min(w - 1, int(round(min(xs)))))
+                    x1 = max(0, min(w - 1, int(round(max(xs)))))
+                    y0 = max(0, min(h - 1, int(round(min(ys)))))
+                    y1 = max(0, min(h - 1, int(round(max(ys)))))
+                    if x1 - x0 > 4 and y1 - y0 > 4:
+                        st.session_state[ck_boxes].append((x0, y0, x1, y1))
+                st.session_state[ck_last] = sig
+                st.rerun()
 
     return sorted(boxes, key=lambda r: r[0])
 
@@ -141,7 +146,7 @@ def ratio_table(df_t, df_r):
     if m.empty:
         st.error("目的蛋白与内参泳道数量不一致")
         return None
-    m["Ratio"] = (m["Target_IntDen"] / m["Ref_IntDen"]).round(4)
+    m["Ratio"]            = (m["Target_IntDen"] / m["Ref_IntDen"]).round(4)
     m["Normalized_Ratio"] = (m["Ratio"] / m["Ratio"].iloc[0]).round(4)
     return m
 
@@ -207,11 +212,11 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
 
     tab_t, tab_r = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_t:
-        rois_t = box_selector(img_t, key="t2s", label="目的蛋白：点击画框",
-                              color=(0,220,80))
+        rois_t = box_selector(img_t, key="t2s", label="目的蛋白：拖动画框",
+                              color="#00dc50")
     with tab_r:
-        rois_r = box_selector(img_r, key="r2s", label="内参：点击画框",
-                              color=(0,170,255))
+        rois_r = box_selector(img_r, key="r2s", label="内参：拖动画框",
+                              color="#00aaff")
     if not rois_t or not rois_r:
         st.stop()
 
@@ -252,10 +257,10 @@ else:
     tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_tgt:
         rois_t = box_selector(img, key="s3t", label="目的蛋白条带",
-                              color=(0,220,80))
+                              color="#00dc50")
     with tab_ref:
         rois_r = box_selector(img, key="s3r", label="内参条带",
-                              color=(0,170,255))
+                              color="#00aaff")
     if not rois_t or not rois_r:
         st.stop()
 
