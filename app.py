@@ -515,7 +515,7 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
             cx0, cy0, cx1, cy1 = crop_t
             img_tc = img_t[cy0:cy1, cx0:cx1]
             st.divider()
-            rois_tl = box_selector(img_tc, key="t2_bands", label="目的蛋白：框选条带",
+            rois_tl = box_selector(img_tc, key="t2_bands", label="第二步：框选定量蛋白（目的蛋白）",
                                    color="#00dc50")
         else:
             rois_tl = []
@@ -525,7 +525,7 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
             cx0r, cy0r, cx1r, cy1r = crop_r
             img_rc = img_r[cy0r:cy1r, cx0r:cx1r]
             st.divider()
-            rois_rl = box_selector(img_rc, key="r2_bands", label="内参：框选条带",
+            rois_rl = box_selector(img_rc, key="r2_bands", label="第二步：框选定量蛋白（内参）",
                                    color="#00aaff")
         else:
             rois_rl = []
@@ -593,10 +593,10 @@ else:  # 单膜对比
     st.markdown("**第二步：框选定量蛋白**")
     tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_tgt:
-        rois_tl = box_selector(img_c, key="s3t", label="目的蛋白条带",
+        rois_tl = box_selector(img_c, key="s3t", label="第二步：框选定量蛋白（目的蛋白）",
                                color="#00dc50")
     with tab_ref:
-        rois_rl = box_selector(img_c, key="s3r", label="内参条带",
+        rois_rl = box_selector(img_c, key="s3r", label="第二步：框选定量蛋白（内参）",
                                color="#00aaff")
 
     if not rois_tl or not rois_rl:
