@@ -22,10 +22,10 @@ with st.sidebar:
     radius = st.slider("背景去除半径（rolling ball）", 10, 150, 50, 5)
     st.divider()
     st.markdown(
-        "**画框说明**\n\n"
-        "在图片上**拖动鼠标**框选条带\n\n"
-        "每拖一次 = 添加一个框\n\n"
-        "点「🗑 清空」重新开始"
+        "**操作流程**\n\n"
+        "① 框出膜的范围（粗选）\n\n"
+        "② 在放大图上精确框选条带\n\n"
+        "点「🗑」重新开始该步骤"
     )
 
 
@@ -37,63 +37,33 @@ def load_image(uploaded) -> np.ndarray | None:
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def box_selector(img_bgr: np.ndarray, key: str,
-                 label: str = "", color: str = "#00dc50"):
-    """Drag-to-draw ROI selector with zoom/pan mode for precision."""
+def _plotly_selector(img_bgr, key, color, disp_h, dragmode="select", single=False):
+    """Core Plotly chart with drag-to-select. Returns updated boxes list."""
     ck_boxes = f"{key}_boxes"
-    ck_last  = f"{key}_last_sel"
-    ck_mode  = f"{key}_mode"
-    for k, d in [(ck_boxes, []), (ck_last, None), (ck_mode, "select")]:
+    ck_last  = f"{key}_last"
+    for k, d in [(ck_boxes, []), (ck_last, None)]:
         if k not in st.session_state:
             st.session_state[k] = d
 
-    boxes    = st.session_state[ck_boxes]
-    cur_mode = st.session_state[ck_mode]
-    h, w     = img_bgr.shape[:2]
-
-    if label:
-        st.markdown(f"**{label}**")
-
-    c1, c2, c3 = st.columns([3, 3, 1])
-    with c1:
-        if st.button("🔍 放大/平移", key=f"{key}_pan_btn",
-                     type="primary" if cur_mode == "pan" else "secondary"):
-            st.session_state[ck_mode] = "pan"
-            st.rerun()
-    with c2:
-        if st.button("⬜ 框选条带", key=f"{key}_sel_btn",
-                     type="primary" if cur_mode == "select" else "secondary"):
-            st.session_state[ck_mode] = "select"
-            st.rerun()
-    with c3:
-        if st.button("🗑 清空", key=f"{key}_clr"):
-            st.session_state[ck_boxes] = []
-            st.session_state[ck_last]  = None
-            st.rerun()
-
-    if cur_mode == "pan":
-        st.info("🔍 拖动平移 · 滚轮缩放，精准定位后点「⬜ 框选条带」")
-    elif boxes:
-        st.success(f"✅ 已画 {len(boxes)} 个框，继续拖动可添加")
-    else:
-        st.info("⬜ 在图片上拖动鼠标框选条带区域")
-
+    h, w    = img_bgr.shape[:2]
+    boxes   = st.session_state[ck_boxes]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
     fig = go.Figure()
     fig.add_trace(go.Image(z=img_rgb))
 
     fs = max(11, int(max(1.0, w / 800) * 13))
-    for i, (x0, y0, x1, y1) in enumerate(boxes):
-        # No ±0.5 offset — draw at exact pixel coordinates
+    draw = boxes[-1:] if single and boxes else boxes   # single mode: show only last
+    for i, (x0, y0, x1, y1) in enumerate(draw):
         fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
                       line=dict(color=color, width=2))
-        fig.add_annotation(x=x0 + 4, y=y0 + fs, text=f"<b>L{i+1}</b>",
-                           showarrow=False, xanchor="left",
-                           font=dict(color=color, size=fs))
+        if not single:
+            fig.add_annotation(x=x0+4, y=y0+fs, text=f"<b>L{i+1}</b>",
+                               showarrow=False, xanchor="left",
+                               font=dict(color=color, size=fs))
 
-    disp_h = min(650, max(300, int(700 * h / w)))
     fig.update_layout(
-        dragmode=cur_mode,
+        dragmode=dragmode,
         margin=dict(l=0, r=0, t=0, b=0),
         height=disp_h,
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
@@ -101,33 +71,121 @@ def box_selector(img_bgr: np.ndarray, key: str,
         newselection=dict(line=dict(color=color, width=2, dash="dash")),
     )
 
-    event = st.plotly_chart(
-        fig,
-        use_container_width=True,
-        key=f"{key}_chart",
-        on_select="rerun",
-        selection_mode=["box"],
-    )
+    event = st.plotly_chart(fig, use_container_width=True, key=f"{key}_chart",
+                            on_select="rerun", selection_mode=["box"])
 
-    if cur_mode == "select" and event and event.selection:
-        sel_boxes = event.selection.get("box", [])
-        if sel_boxes:
-            sig = str(sel_boxes[0])
+    if dragmode == "select" and event and event.selection:
+        sel = event.selection.get("box", [])
+        if sel:
+            sig = str(sel[0])
             if sig != st.session_state[ck_last]:
-                b  = sel_boxes[0]
+                b  = sel[0]
                 xs = b.get("x", [])
                 ys = b.get("y", [])
                 if len(xs) >= 2 and len(ys) >= 2:
-                    x0 = max(0, min(w - 1, int(round(min(xs)))))
-                    x1 = max(0, min(w - 1, int(round(max(xs)))))
-                    y0 = max(0, min(h - 1, int(round(min(ys)))))
-                    y1 = max(0, min(h - 1, int(round(max(ys)))))
-                    if x1 - x0 > 4 and y1 - y0 > 4:
-                        st.session_state[ck_boxes].append((x0, y0, x1, y1))
+                    bx0 = max(0, min(w-1, int(round(min(xs)))))
+                    bx1 = max(0, min(w-1, int(round(max(xs)))))
+                    by0 = max(0, min(h-1, int(round(min(ys)))))
+                    by1 = max(0, min(h-1, int(round(max(ys)))))
+                    if bx1 - bx0 > 4 and by1 - by0 > 4:
+                        if single:
+                            st.session_state[ck_boxes] = [(bx0, by0, bx1, by1)]
+                        else:
+                            st.session_state[ck_boxes].append((bx0, by0, bx1, by1))
                 st.session_state[ck_last] = sig
                 st.rerun()
 
-    # Fine-tune panel: edit coordinates numerically after drawing
+    return st.session_state[ck_boxes]
+
+
+def crop_selector(img_bgr, key):
+    """Step 1: coarsely select the membrane region on the full image."""
+    ck_mode = f"{key}_crop_mode"
+    if ck_mode not in st.session_state:
+        st.session_state[ck_mode] = "select"
+
+    h, w   = img_bgr.shape[:2]
+    boxes  = st.session_state.get(f"{key}_crop_boxes", [])
+    crop   = boxes[-1] if boxes else None
+
+    st.markdown("**第一步：框出膜的范围**（粗选即可）")
+
+    c1, c2, c3 = st.columns([3, 3, 1])
+    with c1:
+        if st.button("🔍 放大/平移", key=f"{key}_crop_pan",
+                     type="primary" if st.session_state[ck_mode]=="pan" else "secondary"):
+            st.session_state[ck_mode] = "pan"
+            st.rerun()
+    with c2:
+        if st.button("⬜ 框选膜", key=f"{key}_crop_sel",
+                     type="primary" if st.session_state[ck_mode]=="select" else "secondary"):
+            st.session_state[ck_mode] = "select"
+            st.rerun()
+    with c3:
+        if st.button("🗑", key=f"{key}_crop_clr"):
+            st.session_state[f"{key}_crop_boxes"] = []
+            st.session_state[f"{key}_crop_last"]  = None
+            st.rerun()
+
+    if crop:
+        x0, y0, x1, y1 = crop
+        st.success(f"✅ 膜区域：x {x0}–{x1}，y {y0}–{y1}　↓ 请在第二步精确框选条带")
+    elif st.session_state[ck_mode] == "pan":
+        st.info("🔍 平移/缩放定位后，切换到「⬜ 框选膜」")
+    else:
+        st.info("拖动鼠标框出膜的大致范围")
+
+    disp_h = min(400, max(200, int(500 * h / w)))
+    _plotly_selector(img_bgr, key=f"{key}_crop",
+                     color="#ff8800", disp_h=disp_h,
+                     dragmode=st.session_state[ck_mode], single=True)
+
+    boxes = st.session_state.get(f"{key}_crop_boxes", [])
+    return boxes[-1] if boxes else None
+
+
+def box_selector(img_bgr, key, label="", color="#00dc50"):
+    """Step 2: precisely select bands on the (cropped) image."""
+    ck_mode = f"{key}_mode"
+    if ck_mode not in st.session_state:
+        st.session_state[ck_mode] = "select"
+
+    h, w = img_bgr.shape[:2]
+    boxes = st.session_state.get(f"{key}_boxes", [])
+
+    if label:
+        st.markdown(f"**{label}**")
+
+    c1, c2, c3 = st.columns([3, 3, 1])
+    with c1:
+        if st.button("🔍 放大/平移", key=f"{key}_pan",
+                     type="primary" if st.session_state[ck_mode]=="pan" else "secondary"):
+            st.session_state[ck_mode] = "pan"
+            st.rerun()
+    with c2:
+        if st.button("⬜ 框选条带", key=f"{key}_sel",
+                     type="primary" if st.session_state[ck_mode]=="select" else "secondary"):
+            st.session_state[ck_mode] = "select"
+            st.rerun()
+    with c3:
+        if st.button("🗑 清空", key=f"{key}_clr"):
+            st.session_state[f"{key}_boxes"] = []
+            st.session_state[f"{key}_last"]  = None
+            st.rerun()
+
+    cur_mode = st.session_state[ck_mode]
+    if cur_mode == "pan":
+        st.info("🔍 缩放定位后，切换「⬜ 框选条带」")
+    elif boxes:
+        st.success(f"✅ 已画 {len(boxes)} 个框，继续拖动可添加")
+    else:
+        st.info("⬜ 拖动鼠标框选每条泳道的条带")
+
+    disp_h = min(650, max(300, int(700 * h / w)))
+    boxes  = _plotly_selector(img_bgr, key=key, color=color,
+                               disp_h=disp_h, dragmode=cur_mode)
+
+    # Fine-tune panel
     if boxes:
         with st.expander(f"🎯 精确调整坐标（{len(boxes)} 个框）"):
             with st.form(key=f"{key}_tune_form"):
@@ -148,10 +206,15 @@ def box_selector(img_bgr: np.ndarray, key: str,
                                                key=f"{key}_fy1_{i}", label_visibility="collapsed")
                     new_vals.append((int(nx0), int(ny0), int(nx1), int(ny1)))
                 if st.form_submit_button("✅ 应用调整"):
-                    st.session_state[ck_boxes] = new_vals
+                    st.session_state[f"{key}_boxes"] = new_vals
                     st.rerun()
 
-    return sorted(st.session_state[ck_boxes], key=lambda r: r[0])
+    return sorted(st.session_state.get(f"{key}_boxes", []), key=lambda r: r[0])
+
+
+def offset_rois(rois, ox, oy):
+    """Translate cropped-image ROI coordinates back to original image space."""
+    return [(ox+x0, oy+y0, ox+x1, oy+y1) for x0, y0, x1, y1 in rois]
 
 
 def show_annotated(img_bgr, roi_groups):
@@ -220,10 +283,20 @@ if mode == "单膜分析":
         st.info("请上传图片后开始分析。")
         st.stop()
 
-    rois = box_selector(img, key="s1")
-    if not rois:
+    crop = crop_selector(img, key="s1")
+    if crop is None:
         st.stop()
 
+    cx0, cy0, cx1, cy1 = crop
+    img_c = img[cy0:cy1, cx0:cx1]
+
+    st.divider()
+    st.markdown("**第二步：框选各泳道条带**")
+    rois_local = box_selector(img_c, key="s1_bands")
+    if not rois_local:
+        st.stop()
+
+    rois = offset_rois(rois_local, cx0, cy0)
     with st.spinner("分析中…"):
         _, df, _ = analyze_rois(img, rois, radius=radius)
     st.divider()
@@ -247,13 +320,31 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
 
     tab_t, tab_r = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_t:
-        rois_t = box_selector(img_t, key="t2s", label="目的蛋白：拖动画框",
-                              color="#00dc50")
+        crop_t = crop_selector(img_t, key="t2")
+        if crop_t:
+            cx0, cy0, cx1, cy1 = crop_t
+            img_tc = img_t[cy0:cy1, cx0:cx1]
+            st.divider()
+            rois_tl = box_selector(img_tc, key="t2_bands", label="目的蛋白：框选条带",
+                                   color="#00dc50")
+        else:
+            rois_tl = []
     with tab_r:
-        rois_r = box_selector(img_r, key="r2s", label="内参：拖动画框",
-                              color="#00aaff")
-    if not rois_t or not rois_r:
+        crop_r = crop_selector(img_r, key="r2")
+        if crop_r:
+            cx0r, cy0r, cx1r, cy1r = crop_r
+            img_rc = img_r[cy0r:cy1r, cx0r:cx1r]
+            st.divider()
+            rois_rl = box_selector(img_rc, key="r2_bands", label="内参：框选条带",
+                                   color="#00aaff")
+        else:
+            rois_rl = []
+
+    if not rois_tl or not rois_rl:
         st.stop()
+
+    rois_t = offset_rois(rois_tl, crop_t[0], crop_t[1])
+    rois_r = offset_rois(rois_rl, crop_r[0], crop_r[1])
 
     with st.spinner("分析中…"):
         _, df_t, _ = analyze_rois(img_t, rois_t, radius=radius)
@@ -281,7 +372,7 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         }, base)
 
 
-else:
+else:  # 单膜对比
     uploaded = st.file_uploader("上传 WB 图片（含两条带）",
                                 type=["jpg","jpeg","png","tif","tiff","bmp"])
     img = load_image(uploaded)
@@ -289,15 +380,28 @@ else:
         st.info("请上传图片后开始分析。")
         st.stop()
 
+    crop = crop_selector(img, key="s3")
+    if crop is None:
+        st.stop()
+
+    cx0, cy0, cx1, cy1 = crop
+    img_c = img[cy0:cy1, cx0:cx1]
+
+    st.divider()
+    st.markdown("**第二步：分别框选目的蛋白和内参条带**")
     tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_tgt:
-        rois_t = box_selector(img, key="s3t", label="目的蛋白条带",
-                              color="#00dc50")
+        rois_tl = box_selector(img_c, key="s3t", label="目的蛋白条带",
+                               color="#00dc50")
     with tab_ref:
-        rois_r = box_selector(img, key="s3r", label="内参条带",
-                              color="#00aaff")
-    if not rois_t or not rois_r:
+        rois_rl = box_selector(img_c, key="s3r", label="内参条带",
+                               color="#00aaff")
+
+    if not rois_tl or not rois_rl:
         st.stop()
+
+    rois_t = offset_rois(rois_tl, cx0, cy0)
+    rois_r = offset_rois(rois_rl, cx0, cy0)
 
     with st.spinner("分析中…"):
         _, df_t, _ = analyze_rois(img, rois_t, radius=radius)
