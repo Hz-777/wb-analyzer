@@ -37,6 +37,13 @@ with st.sidebar:
     st.selectbox("图表类型", ["竖向柱状图", "横向柱状图", "棒棒糖图"], key="viz_type")
     st.checkbox("显示数值标签", value=True, key="viz_showval")
     st.slider("图表高度 px", 280, 700, 400, 20, key="viz_height")
+    st.slider("字体大小", 8, 22, 13, 1, key="viz_fontsize")
+    st.slider("轴线 / 描边粗细", 0.5, 4.0, 1.0, 0.5, key="viz_linewidth")
+    st.checkbox("自定义 Y 轴范围", value=False, key="viz_ycustom")
+    if st.session_state.get("viz_ycustom"):
+        _yc1, _yc2 = st.columns(2)
+        _yc1.number_input("Y 最小值", value=0.0, step=0.1, format="%.2f", key="viz_ymin")
+        _yc2.number_input("Y 最大值", value=2.0, step=0.1, format="%.2f", key="viz_ymax")
     st.divider()
     st.markdown(
         "**操作流程**\n\n"
@@ -309,55 +316,75 @@ def excel_download(sheets, base):
 
 def make_chart(series, y_label="IntDen"):
     """Render a publication-quality Plotly chart using sidebar style settings."""
-    palette    = st.session_state.get("viz_palette", "NPG · Nature")
-    chart_type = st.session_state.get("viz_type",    "竖向柱状图")
-    show_val   = st.session_state.get("viz_showval", True)
-    fig_h      = st.session_state.get("viz_height",  400)
+    palette    = st.session_state.get("viz_palette",   "NPG · Nature")
+    chart_type = st.session_state.get("viz_type",      "竖向柱状图")
+    show_val   = st.session_state.get("viz_showval",   True)
+    fig_h      = st.session_state.get("viz_height",    400)
+    fontsize   = st.session_state.get("viz_fontsize",  13)
+    lw         = st.session_state.get("viz_linewidth", 1.0)
+    ycustom    = st.session_state.get("viz_ycustom",   False)
+    ymin_usr   = st.session_state.get("viz_ymin",      0.0)
+    ymax_usr   = st.session_state.get("viz_ymax",      2.0)
 
-    colors = PALETTES[palette]
-    labels = [str(x) for x in series.index]
-    vals   = series.values.tolist()
+    colors     = PALETTES[palette]
+    labels     = [str(x) for x in series.index]
+    vals       = series.values.tolist()
     bar_colors = [colors[i % len(colors)] for i in range(len(vals))]
-    text   = [f"{v:.3g}" for v in vals] if show_val else None
+    text       = [f"{v:.3g}" for v in vals] if show_val else None
+    max_val    = max(vals) if vals else 1
+
+    # Y-axis range
+    if ycustom and ymax_usr > ymin_usr:
+        y_range  = [ymin_usr, ymax_usr]
+        x_range  = [ymin_usr, ymax_usr]   # for horizontal
+    else:
+        y_range  = [0, max_val * 1.20]
+        x_range  = [0, max_val * 1.25]
 
     base = dict(
         height=fig_h,
         plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(family="Arial, Helvetica, sans-serif", size=13),
+        font=dict(family="Arial, Helvetica, sans-serif", size=fontsize),
         margin=dict(l=70, r=30, t=30, b=70),
         showlegend=False,
     )
-    axis_style = dict(showgrid=True, gridcolor="#EBEBEB", zeroline=True,
-                      zerolinecolor="#CCCCCC", showline=True, linecolor="#444444",
-                      ticks="outside", tickcolor="#444444")
+    ax_common = dict(
+        showgrid=True, gridcolor="#EBEBEB", gridwidth=max(0.5, lw * 0.5),
+        zeroline=True, zerolinecolor="#BBBBBB", zerolinewidth=lw,
+        showline=True, linecolor="#444444", linewidth=lw,
+        ticks="outside", tickcolor="#444444", tickwidth=lw,
+        tickfont=dict(size=fontsize),
+    )
 
     if chart_type == "竖向柱状图":
         fig = go.Figure(go.Bar(
-            x=labels, y=vals, marker_color=bar_colors, marker_line_width=0,
-            text=text, textposition="outside",
-            cliponaxis=False,
+            x=labels, y=vals, marker_color=bar_colors,
+            marker_line_width=0, text=text, textposition="outside",
+            textfont=dict(size=fontsize), cliponaxis=False,
         ))
         fig.update_layout(**base,
-            yaxis=dict(title=y_label, **axis_style),
+            yaxis=dict(title=dict(text=y_label, font=dict(size=fontsize)),
+                       range=y_range, **ax_common),
             xaxis=dict(showgrid=False, showline=True, linecolor="#444444",
-                       ticks="outside", tickcolor="#444444"),
+                       linewidth=lw, ticks="outside", tickcolor="#444444",
+                       tickwidth=lw, tickfont=dict(size=fontsize)),
         )
-        # Add a little headroom so top labels aren't clipped
-        fig.update_yaxes(range=[0, max(vals) * 1.18])
 
     elif chart_type == "横向柱状图":
         fig = go.Figure(go.Bar(
             y=labels, x=vals, orientation="h",
             marker_color=bar_colors, marker_line_width=0,
             text=text, textposition="outside",
-            cliponaxis=False,
+            textfont=dict(size=fontsize), cliponaxis=False,
         ))
         fig.update_layout(**base,
-            xaxis=dict(title=y_label, **axis_style),
+            xaxis=dict(title=dict(text=y_label, font=dict(size=fontsize)),
+                       range=x_range, **ax_common),
             yaxis=dict(showgrid=False, showline=True, linecolor="#444444",
-                       ticks="outside", tickcolor="#444444", autorange="reversed"),
+                       linewidth=lw, ticks="outside", tickcolor="#444444",
+                       tickwidth=lw, tickfont=dict(size=fontsize),
+                       autorange="reversed"),
         )
-        fig.update_xaxes(range=[0, max(vals) * 1.22])
 
     else:  # 棒棒糖图
         fig = go.Figure()
@@ -365,21 +392,24 @@ def make_chart(series, y_label="IntDen"):
             c = colors[i % len(colors)]
             fig.add_trace(go.Scatter(
                 x=[lbl, lbl], y=[0, val], mode="lines",
-                line=dict(color=c, width=2), showlegend=False,
+                line=dict(color=c, width=lw * 1.5), showlegend=False,
             ))
             fig.add_trace(go.Scatter(
                 x=[lbl], y=[val],
                 mode="markers+text" if show_val else "markers",
-                marker=dict(color=c, size=14, line=dict(color="white", width=1.5)),
+                marker=dict(color=c, size=max(8, fontsize),
+                            line=dict(color="white", width=lw)),
                 text=[f"{val:.3g}"] if show_val else None,
                 textposition="top center",
+                textfont=dict(size=fontsize),
                 showlegend=False,
             ))
         fig.update_layout(**base,
-            yaxis=dict(title=y_label, **axis_style,
-                       range=[0, max(vals) * 1.22]),
+            yaxis=dict(title=dict(text=y_label, font=dict(size=fontsize)),
+                       range=y_range, **ax_common),
             xaxis=dict(showgrid=False, showline=True, linecolor="#444444",
-                       ticks="outside", tickcolor="#444444"),
+                       linewidth=lw, ticks="outside", tickcolor="#444444",
+                       tickwidth=lw, tickfont=dict(size=fontsize)),
         )
 
     return fig
