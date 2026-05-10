@@ -329,7 +329,7 @@ def ratio_table(df_t, df_r):
     return m
 
 
-def excel_download(sheets, base):
+def excel_download(sheets, base, key="dl"):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for name, df in sheets.items():
@@ -337,7 +337,8 @@ def excel_download(sheets, base):
     buf.seek(0)
     st.download_button("⬇️ 下载 Excel", data=buf,
         file_name=base + "_WB.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=key)
 
 
 def make_chart(series, y_label="IntDen"):
@@ -441,7 +442,7 @@ def make_chart(series, y_label="IntDen"):
     return fig
 
 
-def show_quant(df, uploaded, extra_sheets=None, enhanced=None, rois=None):
+def show_quant(df, uploaded, extra_sheets=None, enhanced=None, rois=None, dl_key="dl_main"):
     cols = [c for c in ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
             if c in df.columns]
     st.subheader(f"定量结果（{len(df)} 个条带）")
@@ -462,7 +463,7 @@ def show_quant(df, uploaded, extra_sheets=None, enhanced=None, rois=None):
     if extra_sheets:
         sheets.update(extra_sheets)
     base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
-    excel_download(sheets, base)
+    excel_download(sheets, base, key=dl_key)
 
     # Enhanced image diagnostic panel
     if enhanced is not None:
@@ -514,7 +515,7 @@ if mode == "单膜分析":
     st.divider()
     show_annotated(img, [(rois, (0,220,80), "L")])
     st.divider()
-    show_quant(df, uploaded, enhanced=enhanced, rois=rois)
+    show_quant(df, uploaded, enhanced=enhanced, rois=rois, dl_key="dl_s1")
 
 
 elif mode == "双膜对比（目的蛋白/内参 分开跑）":
@@ -569,10 +570,10 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
     st.divider()
     st.subheader("目的蛋白")
     show_annotated(img_t, [(rois_t, (0,220,80), "T")])
-    show_quant(df_t, up_t, enhanced=enh_t, rois=rois_t)
+    show_quant(df_t, up_t, enhanced=enh_t, rois=rois_t, dl_key="dl_t2_t")
     st.subheader("内参")
     show_annotated(img_r, [(rois_r, (0,170,255), "R")])
-    show_quant(df_r, up_r, enhanced=enh_r, rois=rois_r)
+    show_quant(df_r, up_r, enhanced=enh_r, rois=rois_r, dl_key="dl_t2_r")
     st.divider()
 
     merged = ratio_table(df_t, df_r)
@@ -590,7 +591,7 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
             "目的蛋白": df_t[[c for c in cols if c in df_t.columns]],
             "内参":     df_r[[c for c in cols if c in df_r.columns]],
             "对比结果": merged,
-        }, base)
+        }, base, key="dl_t2_merged")
 
 
 else:  # 单膜对比
@@ -637,9 +638,9 @@ else:  # 单膜对比
     st.divider()
 
     st.subheader("目的蛋白 — 定量")
-    show_quant(df_t, uploaded, enhanced=enh_t, rois=rois_t)
+    show_quant(df_t, uploaded, enhanced=enh_t, rois=rois_t, dl_key="dl_s3_t")
     st.subheader("内参 — 定量")
-    show_quant(df_r, uploaded, enhanced=enh_r, rois=rois_r)
+    show_quant(df_r, uploaded, enhanced=enh_r, rois=rois_r, dl_key="dl_s3_r")
 
     cols = ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
     merged = ratio_table(df_t, df_r)
@@ -656,4 +657,4 @@ else:  # 单膜对比
             "目的蛋白": df_t[[c for c in cols if c in df_t.columns]],
             "内参":     df_r[[c for c in cols if c in df_r.columns]],
             "对比结果": merged,
-        }, base)
+        }, base, key="dl_s3_merged")
