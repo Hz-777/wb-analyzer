@@ -442,21 +442,10 @@ def make_chart(series, y_label="IntDen"):
     return fig
 
 
-def show_quant(df, uploaded, extra_sheets=None, enhanced=None, rois=None, dl_key="dl_main"):
+def show_quant(df, uploaded, extra_sheets=None, dl_key="dl_main"):
     cols = [c for c in ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
             if c in df.columns]
     st.subheader(f"定量结果（{len(df)} 个条带）")
-
-    # Zero-IntDen diagnostic warning
-    if len(df) > 0 and df["IntDen"].max() == 0:
-        st.error(
-            "⚠️ **所有条带 IntDen = 0**，常见原因：\n\n"
-            "① 框选区域内无条带信号（请检查框是否画在正确位置）\n\n"
-            "② 背景类型误判——请在左侧「🔬 图像设置」切换"
-            "「亮背景·暗条带」或「暗背景·亮条带」\n\n"
-            "③ 背景去除半径过大，把信号一起去掉了（尝试减小 rolling ball 半径）\n\n"
-            "展开下方「预处理结果」查看算法实际看到的信号↓"
-        )
 
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
     sheets = {"定量结果": df[cols]}
@@ -464,20 +453,6 @@ def show_quant(df, uploaded, extra_sheets=None, enhanced=None, rois=None, dl_key
         sheets.update(extra_sheets)
     base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
     excel_download(sheets, base, key=dl_key)
-
-    # Enhanced image diagnostic panel
-    if enhanced is not None:
-        with st.expander("🔍 预处理结果（算法实际看到的信号）", expanded=df["IntDen"].max() == 0):
-            ann_enh = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            ann_enh_bgr = cv2.cvtColor(ann_enh, cv2.COLOR_GRAY2BGR)
-            if rois:
-                for i, (x0, y0, x1, y1) in enumerate(sorted(rois, key=lambda r: r[0])):
-                    cv2.rectangle(ann_enh_bgr, (x0, y0), (x1, y1), (0, 220, 80), 2)
-                    cv2.putText(ann_enh_bgr, f"L{i+1}", (x0+4, y0+18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 80), 2)
-            st.image(cv2.cvtColor(ann_enh_bgr, cv2.COLOR_BGR2RGB),
-                     caption="增强后图像（亮=有效信号，全黑=无信号/背景类型错误）",
-                     use_container_width=True)
 
     if len(df) > 1:
         grp_col = "Group" if "Group" in df.columns else "Lane"
@@ -510,12 +485,12 @@ if mode == "单膜分析":
     rois  = offset_rois(rois_local, cx0, cy0)
     names = lane_names_input(len(rois), key="s1_bands")
     with st.spinner("分析中…"):
-        _, df, enhanced = analyze_rois(img, rois, radius=radius, force_type=get_force_type())
+        _, df, _ = analyze_rois(img, rois, radius=radius, force_type=get_force_type())
     df = apply_names(df, names)
     st.divider()
     show_annotated(img, [(rois, (0,220,80), "L")])
     st.divider()
-    show_quant(df, uploaded, enhanced=enhanced, rois=rois, dl_key="dl_s1")
+    show_quant(df, uploaded, dl_key="dl_s1")
 
 
 elif mode == "双膜对比（目的蛋白/内参 分开跑）":
@@ -562,18 +537,18 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
 
     ft = get_force_type()
     with st.spinner("分析中…"):
-        _, df_t, enh_t = analyze_rois(img_t, rois_t, radius=radius, force_type=ft)
-        _, df_r, enh_r = analyze_rois(img_r, rois_r, radius=radius, force_type=ft)
+        _, df_t, _ = analyze_rois(img_t, rois_t, radius=radius, force_type=ft)
+        _, df_r, _ = analyze_rois(img_r, rois_r, radius=radius, force_type=ft)
     df_t = apply_names(df_t, names)
     df_r = apply_names(df_r, names)
 
     st.divider()
     st.subheader("目的蛋白")
     show_annotated(img_t, [(rois_t, (0,220,80), "T")])
-    show_quant(df_t, up_t, enhanced=enh_t, rois=rois_t, dl_key="dl_t2_t")
+    show_quant(df_t, up_t, dl_key="dl_t2_t")
     st.subheader("内参")
     show_annotated(img_r, [(rois_r, (0,170,255), "R")])
-    show_quant(df_r, up_r, enhanced=enh_r, rois=rois_r, dl_key="dl_t2_r")
+    show_quant(df_r, up_r, dl_key="dl_t2_r")
     st.divider()
 
     merged = ratio_table(df_t, df_r)
@@ -628,8 +603,8 @@ else:  # 单膜对比
 
     ft = get_force_type()
     with st.spinner("分析中…"):
-        _, df_t, enh_t = analyze_rois(img, rois_t, radius=radius, force_type=ft)
-        _, df_r, enh_r = analyze_rois(img, rois_r, radius=radius, force_type=ft)
+        _, df_t, _ = analyze_rois(img, rois_t, radius=radius, force_type=ft)
+        _, df_r, _ = analyze_rois(img, rois_r, radius=radius, force_type=ft)
     df_t = apply_names(df_t, names)
     df_r = apply_names(df_r, names)
 
@@ -638,9 +613,9 @@ else:  # 单膜对比
     st.divider()
 
     st.subheader("目的蛋白 — 定量")
-    show_quant(df_t, uploaded, enhanced=enh_t, rois=rois_t, dl_key="dl_s3_t")
+    show_quant(df_t, uploaded, dl_key="dl_s3_t")
     st.subheader("内参 — 定量")
-    show_quant(df_r, uploaded, enhanced=enh_r, rois=rois_r, dl_key="dl_s3_r")
+    show_quant(df_r, uploaded, dl_key="dl_s3_r")
 
     cols = ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
     merged = ratio_table(df_t, df_r)
