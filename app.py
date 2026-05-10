@@ -149,7 +149,7 @@ def crop_selector(img_bgr, key):
     boxes  = st.session_state.get(f"{key}_crop_boxes", [])
     crop   = boxes[-1] if boxes else None
 
-    st.markdown("**第一步：框出膜的范围**（粗选即可）")
+    st.markdown("**第一步：框出膜上条带大致范围**（粗选即可）")
 
     c1, c2, c3 = st.columns([3, 3, 1])
     with c1:
@@ -170,7 +170,7 @@ def crop_selector(img_bgr, key):
 
     if crop:
         x0, y0, x1, y1 = crop
-        st.success(f"✅ 膜区域：x {x0}–{x1}，y {y0}–{y1}　↓ 请在第二步精确框选条带")
+        st.success(f"✅ 粗选区域：x {x0}–{x1}，y {y0}–{y1}　↓ 请在第二步框选定量蛋白")
     elif st.session_state[ck_mode] == "pan":
         st.info("🔍 平移/缩放定位后，切换到「⬜ 框选膜」")
     else:
@@ -311,7 +311,7 @@ def show_annotated(img_bgr, roi_groups):
         st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB), use_container_width=True)
 
 
-def ratio_table(df_t, df_r):
+def ratio_table(df_t, df_r, ref_lane=1):
     for col in ("Lane", "IntDen"):
         if col not in df_t.columns or col not in df_r.columns:
             st.error(f"结果表缺少列 '{col}'")
@@ -324,8 +324,10 @@ def ratio_table(df_t, df_r):
     if m.empty:
         st.error("目的蛋白与内参泳道数量不一致")
         return None
-    m["Ratio"]            = (m["Target_IntDen"] / m["Ref_IntDen"]).round(4)
-    m["Normalized_Ratio"] = (m["Ratio"] / m["Ratio"].iloc[0]).round(4)
+    m["Ratio"] = (m["Target_IntDen"] / m["Ref_IntDen"]).round(4)
+    ref_rows = m[m["Lane"] == ref_lane]["Ratio"]
+    ref_val = ref_rows.iloc[0] if not ref_rows.empty else m["Ratio"].iloc[0]
+    m["Normalized_Ratio"] = (m["Ratio"] / ref_val).round(4)
     return m
 
 
@@ -477,7 +479,7 @@ if mode == "单膜分析":
     img_c = img[cy0:cy1, cx0:cx1]
 
     st.divider()
-    st.markdown("**第二步：框选各泳道条带**")
+    st.markdown("**第二步：框选定量蛋白**")
     rois_local = box_selector(img_c, key="s1_bands")
     if not rois_local:
         st.stop()
@@ -551,11 +553,14 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
     show_quant(df_r, up_r, dl_key="dl_t2_r")
     st.divider()
 
-    merged = ratio_table(df_t, df_r)
+    lane_options_t2 = sorted(df_t["Lane"].unique().tolist()) if "Lane" in df_t.columns else [1]
+    ref_lane_t2 = st.selectbox("以哪条泳道为 1 归一化？", lane_options_t2,
+                                index=0, key="ref_lane_t2")
+    merged = ratio_table(df_t, df_r, ref_lane=ref_lane_t2)
     if merged is not None:
         st.subheader("对比结果")
         st.dataframe(merged, use_container_width=True, hide_index=True)
-        st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
+        st.caption(f"Normalized_Ratio = 以 Lane {ref_lane_t2} 为 1 归一化")
         idx_col = "Group" if "Group" in merged.columns else "Lane"
         ratio_series = merged.set_index(idx_col)["Normalized_Ratio"]
         st.plotly_chart(make_chart(ratio_series, y_label="Normalized Ratio"),
@@ -585,7 +590,7 @@ else:  # 单膜对比
     img_c = img[cy0:cy1, cx0:cx1]
 
     st.divider()
-    st.markdown("**第二步：分别框选目的蛋白和内参条带**")
+    st.markdown("**第二步：框选定量蛋白**")
     tab_tgt, tab_ref = st.tabs(["🎯 目的蛋白", "⚖️ 内参"])
     with tab_tgt:
         rois_tl = box_selector(img_c, key="s3t", label="目的蛋白条带",
@@ -618,11 +623,14 @@ else:  # 单膜对比
     show_quant(df_r, uploaded, dl_key="dl_s3_r")
 
     cols = ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
-    merged = ratio_table(df_t, df_r)
+    lane_options_s3 = sorted(df_t["Lane"].unique().tolist()) if "Lane" in df_t.columns else [1]
+    ref_lane_s3 = st.selectbox("以哪条泳道为 1 归一化？", lane_options_s3,
+                                index=0, key="ref_lane_s3")
+    merged = ratio_table(df_t, df_r, ref_lane=ref_lane_s3)
     if merged is not None:
         st.subheader("对比结果（目的蛋白 / 内参）")
         st.dataframe(merged, use_container_width=True, hide_index=True)
-        st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
+        st.caption(f"Normalized_Ratio = 以 Lane {ref_lane_s3} 为 1 归一化")
         idx_col = "Group" if "Group" in merged.columns else "Lane"
         ratio_series = merged.set_index(idx_col)["Normalized_Ratio"]
         st.plotly_chart(make_chart(ratio_series, y_label="Normalized Ratio"),
