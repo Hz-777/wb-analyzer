@@ -7,6 +7,17 @@ import streamlit as st
 
 from processor import analyze_rois
 
+# ── color palettes ────────────────────────────────────────────────────────────
+PALETTES = {
+    "NPG · Nature":   ["#E64B35","#4DBBD5","#00A087","#3C5488","#F39B7F","#8491B4","#91D1C2","#DC0000","#7E6148","#B09C85"],
+    "NEJM":           ["#BC3C29","#0072B5","#E18727","#20854E","#7876B1","#6F99AD","#FFDC91","#EE4C97"],
+    "Lancet":         ["#00468B","#ED0000","#42B540","#0099B4","#925E9F","#FDAF91","#AD002A","#ADB6B6"],
+    "JAMA":           ["#374E55","#DF8F44","#00A1D5","#B24745","#79AF97","#6A6599","#80796B"],
+    "Science · AAAS": ["#3B4992","#EE0000","#008B45","#631879","#008280","#BB0021","#5F559B","#A20056"],
+    "蓝色渐变":        ["#08306B","#08519C","#2171B5","#4292C6","#6BAED6","#9ECAE1","#C6DBEF"],
+    "灰度（发表用）":  ["#252525","#525252","#737373","#969696","#BDBDBD"],
+}
+
 st.set_page_config(page_title="WB 条带自动定量", page_icon="🧬", layout="wide")
 st.title("🧬 Western Blot 条带灰度值自动定量")
 
@@ -20,6 +31,12 @@ st.divider()
 with st.sidebar:
     st.header("参数设置")
     radius = st.slider("背景去除半径（rolling ball）", 10, 150, 50, 5)
+    st.divider()
+    st.subheader("📊 图表样式")
+    st.selectbox("配色方案", list(PALETTES.keys()), key="viz_palette")
+    st.selectbox("图表类型", ["竖向柱状图", "横向柱状图", "棒棒糖图"], key="viz_type")
+    st.checkbox("显示数值标签", value=True, key="viz_showval")
+    st.slider("图表高度 px", 280, 700, 400, 20, key="viz_height")
     st.divider()
     st.markdown(
         "**操作流程**\n\n"
@@ -290,6 +307,84 @@ def excel_download(sheets, base):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+def make_chart(series, y_label="IntDen"):
+    """Render a publication-quality Plotly chart using sidebar style settings."""
+    palette    = st.session_state.get("viz_palette", "NPG · Nature")
+    chart_type = st.session_state.get("viz_type",    "竖向柱状图")
+    show_val   = st.session_state.get("viz_showval", True)
+    fig_h      = st.session_state.get("viz_height",  400)
+
+    colors = PALETTES[palette]
+    labels = [str(x) for x in series.index]
+    vals   = series.values.tolist()
+    bar_colors = [colors[i % len(colors)] for i in range(len(vals))]
+    text   = [f"{v:.3g}" for v in vals] if show_val else None
+
+    base = dict(
+        height=fig_h,
+        plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(family="Arial, Helvetica, sans-serif", size=13),
+        margin=dict(l=70, r=30, t=30, b=70),
+        showlegend=False,
+    )
+    axis_style = dict(showgrid=True, gridcolor="#EBEBEB", zeroline=True,
+                      zerolinecolor="#CCCCCC", showline=True, linecolor="#444444",
+                      ticks="outside", tickcolor="#444444")
+
+    if chart_type == "竖向柱状图":
+        fig = go.Figure(go.Bar(
+            x=labels, y=vals, marker_color=bar_colors, marker_line_width=0,
+            text=text, textposition="outside",
+            cliponaxis=False,
+        ))
+        fig.update_layout(**base,
+            yaxis=dict(title=y_label, **axis_style),
+            xaxis=dict(showgrid=False, showline=True, linecolor="#444444",
+                       ticks="outside", tickcolor="#444444"),
+        )
+        # Add a little headroom so top labels aren't clipped
+        fig.update_yaxes(range=[0, max(vals) * 1.18])
+
+    elif chart_type == "横向柱状图":
+        fig = go.Figure(go.Bar(
+            y=labels, x=vals, orientation="h",
+            marker_color=bar_colors, marker_line_width=0,
+            text=text, textposition="outside",
+            cliponaxis=False,
+        ))
+        fig.update_layout(**base,
+            xaxis=dict(title=y_label, **axis_style),
+            yaxis=dict(showgrid=False, showline=True, linecolor="#444444",
+                       ticks="outside", tickcolor="#444444", autorange="reversed"),
+        )
+        fig.update_xaxes(range=[0, max(vals) * 1.22])
+
+    else:  # 棒棒糖图
+        fig = go.Figure()
+        for i, (lbl, val) in enumerate(zip(labels, vals)):
+            c = colors[i % len(colors)]
+            fig.add_trace(go.Scatter(
+                x=[lbl, lbl], y=[0, val], mode="lines",
+                line=dict(color=c, width=2), showlegend=False,
+            ))
+            fig.add_trace(go.Scatter(
+                x=[lbl], y=[val],
+                mode="markers+text" if show_val else "markers",
+                marker=dict(color=c, size=14, line=dict(color="white", width=1.5)),
+                text=[f"{val:.3g}"] if show_val else None,
+                textposition="top center",
+                showlegend=False,
+            ))
+        fig.update_layout(**base,
+            yaxis=dict(title=y_label, **axis_style,
+                       range=[0, max(vals) * 1.22]),
+            xaxis=dict(showgrid=False, showline=True, linecolor="#444444",
+                       ticks="outside", tickcolor="#444444"),
+        )
+
+    return fig
+
+
 def show_quant(df, uploaded, extra_sheets=None):
     cols = [c for c in ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
             if c in df.columns]
@@ -302,8 +397,8 @@ def show_quant(df, uploaded, extra_sheets=None):
     excel_download(sheets, base)
     if len(df) > 1:
         grp_col = "Group" if "Group" in df.columns else "Lane"
-        chart = df.groupby(grp_col)["IntDen"].sum()
-        st.bar_chart(chart)
+        series  = df.groupby(grp_col)["IntDen"].sum()
+        st.plotly_chart(make_chart(series, y_label="IntDen"), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -400,7 +495,9 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         st.dataframe(merged, use_container_width=True, hide_index=True)
         st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
         idx_col = "Group" if "Group" in merged.columns else "Lane"
-        st.bar_chart(merged.set_index(idx_col)["Normalized_Ratio"])
+        ratio_series = merged.set_index(idx_col)["Normalized_Ratio"]
+        st.plotly_chart(make_chart(ratio_series, y_label="Normalized Ratio"),
+                        use_container_width=True)
         cols = ["Lane","Group","Band","Area","Mean","IntDen","RawIntDen"]
         base = up_t.name.rsplit(".",1)[0] if up_t else "wb"
         excel_download({
@@ -459,7 +556,9 @@ else:  # 单膜对比
         st.dataframe(merged, use_container_width=True, hide_index=True)
         st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
         idx_col = "Group" if "Group" in merged.columns else "Lane"
-        st.bar_chart(merged.set_index(idx_col)["Normalized_Ratio"])
+        ratio_series = merged.set_index(idx_col)["Normalized_Ratio"]
+        st.plotly_chart(make_chart(ratio_series, y_label="Normalized Ratio"),
+                        use_container_width=True)
         base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
         excel_download({
             "目的蛋白": df_t[[c for c in cols if c in df_t.columns]],
