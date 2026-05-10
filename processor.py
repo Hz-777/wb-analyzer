@@ -30,16 +30,19 @@ def detect_image_type(gray: np.ndarray) -> str:
 
 # ════════════════════════ preprocessing ══════════════════════════════
 
-def preprocess(img_bgr: np.ndarray, radius: int = 50) -> np.ndarray:
+def preprocess(img_bgr: np.ndarray, radius: int = 50,
+               force_type: str | None = None) -> np.ndarray:
     """Return enhanced image: bands = BRIGHT pixels on BLACK background.
 
     Light-bg (white/grey bg, dark bands):
         background = morphological dilation  →  bg − gray  (dark→bright)
     Dark-bg (fluorescence, bright bands):
         background = morphological opening   →  gray − bg  (bright stays)
+
+    force_type: 'light' | 'dark' | None (auto-detect).
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    img_type = detect_image_type(gray)
+    img_type = force_type if force_type in ("light", "dark") else detect_image_type(gray)
 
     k      = int(radius * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -522,9 +525,10 @@ def analyze_rois(
     img_bgr: np.ndarray,
     rois: list[tuple[int, int, int, int]],
     radius: int = 50,
+    force_type: str | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, np.ndarray]:
     """Measure user-defined rectangular ROIs directly (manual mode)."""
-    enhanced  = preprocess(img_bgr, radius)
+    enhanced  = preprocess(img_bgr, radius, force_type=force_type)
     annotated = img_bgr.copy()
     rows: list[dict] = []
 
