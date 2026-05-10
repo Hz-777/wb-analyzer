@@ -217,6 +217,34 @@ def offset_rois(rois, ox, oy):
     return [(ox+x0, oy+y0, ox+x1, oy+y1) for x0, y0, x1, y1 in rois]
 
 
+def lane_names_input(n_lanes, key):
+    """Editable group-name inputs for each lane. Returns list of name strings."""
+    ck = f"{key}_lnames"
+    saved = st.session_state.get(ck, [])
+    # Grow or shrink to match current lane count, preserving existing entries
+    names = [saved[i] if i < len(saved) else f"Lane {i+1}" for i in range(n_lanes)]
+    st.session_state[ck] = names
+
+    st.markdown("**泳道分组名称**（可修改）")
+    cols = st.columns(min(n_lanes, 8))
+    result = []
+    for i in range(n_lanes):
+        col = cols[i % len(cols)]
+        val = col.text_input(f"L{i+1}", value=names[i],
+                             key=f"{key}_ln_{i}")
+        result.append(val.strip() or f"Lane {i+1}")
+    st.session_state[ck] = result
+    return result
+
+
+def apply_names(df, names):
+    """Insert a Group column that maps Lane number to user-provided name."""
+    mapping = {i + 1: n for i, n in enumerate(names)}
+    out = df.copy()
+    out.insert(1, "Group", out["Lane"].map(mapping).fillna(""))
+    return out
+
+
 def show_annotated(img_bgr, roi_groups):
     ann = img_bgr.copy()
     for rois, color, prefix in roi_groups:
@@ -238,8 +266,10 @@ def ratio_table(df_t, df_r):
         if col not in df_t.columns or col not in df_r.columns:
             st.error(f"结果表缺少列 '{col}'")
             return None
-    t = df_t[["Lane","IntDen"]].rename(columns={"IntDen":"Target_IntDen"})
-    r = df_r[["Lane","IntDen"]].rename(columns={"IntDen":"Ref_IntDen"})
+    t_cols = ["Lane"] + (["Group"] if "Group" in df_t.columns else []) + ["IntDen"]
+    r_cols = ["Lane", "IntDen"]
+    t = df_t[t_cols].rename(columns={"IntDen":"Target_IntDen"})
+    r = df_r[r_cols].rename(columns={"IntDen":"Ref_IntDen"})
     m = t.merge(r, on="Lane", how="inner")
     if m.empty:
         st.error("目的蛋白与内参泳道数量不一致")
@@ -261,7 +291,7 @@ def excel_download(sheets, base):
 
 
 def show_quant(df, uploaded, extra_sheets=None):
-    cols = [c for c in ["Lane","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
+    cols = [c for c in ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
             if c in df.columns]
     st.subheader(f"定量结果（{len(df)} 个条带）")
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
@@ -271,7 +301,9 @@ def show_quant(df, uploaded, extra_sheets=None):
     base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
     excel_download(sheets, base)
     if len(df) > 1:
-        st.bar_chart(df.groupby("Lane")["IntDen"].sum())
+        grp_col = "Group" if "Group" in df.columns else "Lane"
+        chart = df.groupby(grp_col)["IntDen"].sum()
+        st.bar_chart(chart)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -296,9 +328,11 @@ if mode == "单膜分析":
     if not rois_local:
         st.stop()
 
-    rois = offset_rois(rois_local, cx0, cy0)
+    rois  = offset_rois(rois_local, cx0, cy0)
+    names = lane_names_input(len(rois), key="s1_bands")
     with st.spinner("分析中…"):
         _, df, _ = analyze_rois(img, rois, radius=radius)
+    df = apply_names(df, names)
     st.divider()
     show_annotated(img, [(rois, (0,220,80), "L")])
     st.divider()
@@ -345,10 +379,13 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
 
     rois_t = offset_rois(rois_tl, crop_t[0], crop_t[1])
     rois_r = offset_rois(rois_rl, crop_r[0], crop_r[1])
+    names  = lane_names_input(len(rois_t), key="t2_bands")
 
     with st.spinner("分析中…"):
         _, df_t, _ = analyze_rois(img_t, rois_t, radius=radius)
         _, df_r, _ = analyze_rois(img_r, rois_r, radius=radius)
+    df_t = apply_names(df_t, names)
+    df_r = apply_names(df_r, names)
 
     st.divider()
     st.subheader("目的蛋白")
@@ -362,8 +399,9 @@ elif mode == "双膜对比（目的蛋白/内参 分开跑）":
         st.subheader("对比结果")
         st.dataframe(merged, use_container_width=True, hide_index=True)
         st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
-        st.bar_chart(merged.set_index("Lane")["Normalized_Ratio"])
-        cols = ["Lane","Band","Area","Mean","IntDen","RawIntDen"]
+        idx_col = "Group" if "Group" in merged.columns else "Lane"
+        st.bar_chart(merged.set_index(idx_col)["Normalized_Ratio"])
+        cols = ["Lane","Group","Band","Area","Mean","IntDen","RawIntDen"]
         base = up_t.name.rsplit(".",1)[0] if up_t else "wb"
         excel_download({
             "目的蛋白": df_t[[c for c in cols if c in df_t.columns]],
@@ -402,22 +440,26 @@ else:  # 单膜对比
 
     rois_t = offset_rois(rois_tl, cx0, cy0)
     rois_r = offset_rois(rois_rl, cx0, cy0)
+    names  = lane_names_input(len(rois_t), key="s3t")
 
     with st.spinner("分析中…"):
         _, df_t, _ = analyze_rois(img, rois_t, radius=radius)
         _, df_r, _ = analyze_rois(img, rois_r, radius=radius)
+    df_t = apply_names(df_t, names)
+    df_r = apply_names(df_r, names)
 
     st.divider()
     show_annotated(img, [(rois_t,(0,220,80),"T"), (rois_r,(0,170,255),"R")])
     st.divider()
 
-    cols = ["Lane","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
+    cols = ["Lane","Group","Band","Area","Mean","Min","Max","IntDen","RawIntDen"]
     merged = ratio_table(df_t, df_r)
     if merged is not None:
         st.subheader("对比结果（目的蛋白 / 内参）")
         st.dataframe(merged, use_container_width=True, hide_index=True)
         st.caption("Normalized_Ratio = 以 Lane 1 为 1 归一化")
-        st.bar_chart(merged.set_index("Lane")["Normalized_Ratio"])
+        idx_col = "Group" if "Group" in merged.columns else "Lane"
+        st.bar_chart(merged.set_index(idx_col)["Normalized_Ratio"])
         base = uploaded.name.rsplit(".",1)[0] if uploaded else "wb"
         excel_download({
             "目的蛋白": df_t[[c for c in cols if c in df_t.columns]],
